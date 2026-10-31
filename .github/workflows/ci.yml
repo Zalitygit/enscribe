@@ -1,0 +1,99 @@
+# Reproducible test evidence per commit.
+#
+# Why this exists: an external review of the 0.1.0 archive could not run the
+# suite, because the archive shipped without dependencies, and recorded
+# "dependencies were absent" as the reason it could not verify any claim about
+# behaviour. Every test result before this was hand-produced and pasted into a
+# commit message by whoever happened to run it. That is an assertion, not
+# evidence.
+#
+# Runs on the GitHub mirror. The canonical remote is self-hosted with no runner,
+# so this is genuinely mirror-only: a green badge here says the mirror's HEAD
+# passed, and the mirror can lag origin (a bare `git push` does not reach it).
+# Check the commit SHA, not just the colour.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Pinned to 22 (2026-08-16). This used to run both ends of the supported
+        # range, ["22", "24"], to catch a version bump breaking an edge.
+        #
+        # Node 24 was removed because it fails here for a reason no change to
+        # this repo can fix. better-sqlite3's Statement destructor runs after the
+        # vitest worker's Node environment is torn down, and Node 24 asserts on
+        # it:
+        #
+        #   node::RemoveEnvironmentCleanupHook(...) at ../src/api/hooks.cc:142
+        #   Assertion failed: (env) != nullptr
+        #     3: Statement::~Statement() [better_sqlite3.node]
+        #
+        # The worker aborts, so two of the 48 test files never report and the
+        # run exits non-zero. Zero assertions fail. It is a teardown race the
+        # runner's timing exposes: the same suite on the same Node 24 passes
+        # 48/48 on a developer box, which is why the retry step below cannot
+        # help - it is deterministic here and a coin flip nowhere else.
+        #
+        # The coverage gap this opened was closed the same day: package.json
+        # engines and core/node-guard.ts were both narrowed to >=22 <24, so the
+        # declared range, the runtime guard and this matrix now agree. Only
+        # Node 23 is supported-but-untested, and it sits between two tested
+        # neighbours rather than past the edge.
+        #
+        # Re-add "24" here, and widen engines and the guard back to <25, once
+        # better-sqlite3 lands a Node 24 teardown fix. All three move together.
+        node: ["22"]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      # better-sqlite3 and sqlite-vec are native; `npm ci` builds them against
+      # the matrix Node rather than reusing a binary built for another ABI.
+      - name: Install
+        run: npm ci
+
+      # The ONNX embedder downloads ~100MB on its first ever call, which two
+      # integration tests exercise. Cached across runs so a green suite does not
+      # depend on HuggingFace being reachable every time; a cold cache still
+      # works, it is just slower.
+      - name: Cache the embedding model
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/huggingface
+          key: hf-nomic-embed-text-v1.5
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      # Known flake: test/pages/vault-watch.test.ts loses a chokidar timing race
+      # under full-suite parallel load, roughly two runs in three, and passes in
+      # isolation every time. It is NOT excluded here, deliberately - hiding it
+      # would make CI green while the condition that makes every red result a
+      # judgement call is still present. A retry is the honest compromise: it
+      # keeps the signal and stops the flake from blocking the branch.
+      - name: Test
+        run: npm test
+        id: test
+        continue-on-error: true
+
+      - name: Test (retry once, for the known watcher flake)
+        if: steps.test.outcome == 'failure'
+        run: npm test

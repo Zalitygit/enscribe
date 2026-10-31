@@ -1,0 +1,15 @@
+-- migrations/011_finding_due.sql
+--
+-- A due date for the `needs-human` kind: items a session found that only the owner can
+-- act on (re-auth a token, restore a file, decide where secrets live).
+--
+-- The mechanical detectors have no deadlines -- an orphan page is equally
+-- orphaned tomorrow -- so `due` is NULL for every kind but this one. It is
+-- here rather than encoded in `detail` because ordering by it is the point:
+-- the report this replaced led with "HARD DEADLINE 2026-08-20 20:39 UTC" and
+-- an ask that expires ranks above one that merely waits.
+--
+-- Stored as an ISO 8601 string, matching first_seen/last_seen/state_changed_at.
+-- Not validated in SQL; the MCP tool that writes it is the one enforcement
+-- point, so a hand-written UPDATE can still put junk here.
+ALTER TABLE findings ADD COLUMN due TEXT;

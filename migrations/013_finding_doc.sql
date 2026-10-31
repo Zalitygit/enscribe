@@ -1,0 +1,25 @@
+-- migrations/013_finding_doc.sql
+--
+-- A pointer to the document that holds the assignment, for the appendable
+-- kinds (`needs-human`, `todo`). NULL for every mechanically detected kind: an
+-- orphan page has no write-up, it has a condition.
+--
+-- Why a column and not just prose in `detail`. `detail` is a SNAPSHOT — it is
+-- refreshed on a re-file and is otherwise frozen at whatever the filing session
+-- knew. A plan, a migration, or anything that changes as it is worked belongs
+-- on a wiki page instead: git-backed, editable in Obsidian, searchable, and
+-- linkable. Putting the page name in its own column rather than in the prose is
+-- what lets the readers render it distinctly — the SessionStart hook can print
+-- it on the row, and `macbrain findings show` can check whether it still
+-- resolves and say so when it does not.
+--
+-- Stored as a page slug, the same identifier `get_page` and `[[wikilinks]]`
+-- resolve. A path is accepted too and simply will not resolve; the readers
+-- report that rather than rejecting it, because the finding may legitimately be
+-- filed BEFORE the page it points at is written.
+--
+-- Deliberately NOT validated here, and not at the write path either. Refusing a
+-- filing because the page does not exist yet would make the ledger reject the
+-- exact case it is meant to support — record the ask now, write the page next.
+-- Validation is a read-side report, never a write-side gate.
+ALTER TABLE findings ADD COLUMN doc TEXT;
