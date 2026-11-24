@@ -71,3 +71,21 @@ test("DAEMON_KINDS excludes the unfit rot detectors", () => {
   expect(DAEMON_KINDS).not.toContain("rot-future-date");
   expect(DAEMON_KINDS).not.toContain("rot-stale-todo");
 });
+
+test("runDetection raises and resolves stale pages, with the limit from STALE_DAYS", async () => {
+  await svc.ingest("wiki/concepts/p.md", "---\ntitle: P\nverified: { by: human:owner, at: 2026-01-01 }\n---\n# P\n[[Q]]\n");
+  await svc.ingest("wiki/concepts/q.md", "---\ntitle: Q\n---\n# Q\n[[P]]\n");
+  const now = new Date("2026-10-31T00:00:00Z");
+  process.env.ENSCRIBE_STALE_DAYS = "400";
+  try {
+    runDetection(store, findings, now);
+    expect(findings.get("stale:p")).toBeUndefined();
+  } finally {
+    delete process.env.ENSCRIBE_STALE_DAYS;
+  }
+  runDetection(store, findings, now); // default 180
+  expect(findings.get("stale:p")!.state).toBe("open");
+  await svc.ingest("wiki/concepts/p.md", "---\ntitle: P\nverified: { by: human:owner, at: 2026-10-30 }\n---\n# P\n[[Q]]\n");
+  runDetection(store, findings, now);
+  expect(findings.get("stale:p")!.state).toBe("resolved");
+});

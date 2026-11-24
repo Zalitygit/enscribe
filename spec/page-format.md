@@ -33,6 +33,14 @@ Only `type` is promoted to a column; the other three are carried. MacBrain does
 not implement OKF and is not an OKF consumer — it happens to index a corpus that
 follows it.
 
+One exception reads frontmatter without a column: the nightly `stale` detector
+(`detectStale` in `src/findings/detectors.ts`) reads OKF `stale_after` (§5.5;
+stale when today >= the date, and when present it decides alone) and, failing
+that, `verified` (§5.2; stale when the latest `at` is more than `STALE_DAYS`,
+default 180, before today). A page with neither is never stale. A malformed
+value is itself a finding, so a typo cannot switch the check off. Both fields
+stay carried; nothing is promoted to a column.
+
 - **`type` is shape-validated, never value-validated** (`frontmatterType()` in
   `parse.ts`, mirrored by migration 012's SQL). A non-empty string is taken as
   is; `type: [a, b]` and `type: 3` parse fine as YAML and become NULL rather

@@ -193,6 +193,66 @@ test("replaceChunks clears prior chunks for the slug", async () => {
   expect(db.prepare(`SELECT count(*) AS c FROM vec_page_chunks`).get()).toEqual({ c: 1 });
 });
 
+async function chunksOf(n: number) {
+  const v = await new FakeEmbedder().embed("a", "document");
+  return Array.from({ length: n }, (_, i) => ({ ordinal: i, heading: null, text: `t${i}`, embedding: v }));
+}
+
+// Vectors whose page_chunks rows were lost are invisible to the delete-by-slug.
+// A rebuild with fewer chunks must still clear the ones past the new count.
+test("replaceChunks clears leftover vectors past the new chunk count", async () => {
+  store.upsertPage({ slug: "p", title: "P", frontmatter: {}, body: "x" });
+  store.replaceChunks("p", "P", [], await chunksOf(5), PROV);
+  db.prepare(`DELETE FROM page_chunks WHERE slug = 'p'`).run();
+  store.replaceChunks("p", "P", [], await chunksOf(2), PROV);
+  const ids = (db.prepare(`SELECT chunk_id FROM vec_page_chunks`).all() as { chunk_id: string }[]).map((r) => r.chunk_id);
+  expect(ids.sort()).toEqual(["p#0", "p#1"]);
+});
+
+test("chunksIntact sees a leftover vector past the expected count", async () => {
+  store.upsertPage({ slug: "p", title: "P", frontmatter: {}, body: "x" });
+  store.replaceChunks("p", "P", [], await chunksOf(2), PROV);
+  expect(store.chunksIntact("p", 2, PROV)).toBe(true);
+  const v = await new FakeEmbedder().embed("a", "document");
+  db.prepare(`INSERT INTO vec_page_chunks (chunk_id, embedding) VALUES ('p#2', ?)`)
+    .run(new Uint8Array(v.buffer, v.byteOffset, v.byteLength));
+  expect(store.chunksIntact("p", 2, PROV)).toBe(false);
+});
+
+// chunksIntact runs for every unchanged page on every sync. `slug` and
+// `chunk_id` are UNINDEXED in both FTS tables, so filtering on them reads the
+// whole table; the keyword rows must be reached by rowid.
+test("chunksIntact reaches the keyword tables by rowid, never by a full scan", async () => {
+  store.upsertPage({ slug: "p", title: "P", frontmatter: {}, body: "x" });
+  store.replaceChunks("p", "P", [], await chunksOf(2), PROV);
+  const sqls: string[] = [];
+  const prepare = db.prepare.bind(db);
+  (db as any).prepare = (sql: string) => { sqls.push(sql); return prepare(sql); };
+  try {
+    expect(store.chunksIntact("p", 2, PROV)).toBe(true);
+  } finally {
+    (db as any).prepare = prepare;
+  }
+  const fts = sqls.filter((s) => /page_chunks_fts/.test(s));
+  expect(fts.length).toBeGreaterThan(0);
+  for (const sql of fts) {
+    const params = (sql.match(/\?/g) ?? []).map(() => null);
+    const plan = (db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...params) as { detail: string }[]).map((r) => r.detail);
+    expect(plan.filter((d) => /VIRTUAL TABLE INDEX 0:$/.test(d))).toEqual([]);
+  }
+});
+
+test("chunksIntact notices a keyword row that was lost", async () => {
+  store.upsertPage({ slug: "p", title: "P", frontmatter: {}, body: "x" });
+  store.replaceChunks("p", "P", [], await chunksOf(2), PROV);
+  for (const table of ["page_chunks_fts", "page_chunks_fts_exact"]) {
+    db.prepare(`DELETE FROM ${table} WHERE chunk_id = 'p#1'`).run();
+    expect(store.chunksIntact("p", 2, PROV)).toBe(false);
+    store.replaceChunks("p", "P", [], await chunksOf(2), PROV);
+    expect(store.chunksIntact("p", 2, PROV)).toBe(true);
+  }
+});
+
 test("softDelete tombstones the page, prunes search rows + outbound edges, keeps page row and aliases", async () => {
   const emb = new FakeEmbedder();
   store.upsertPage({ slug: "gone", title: "Gone Page", frontmatter: {}, body: "x", source_path: "gone.md" });

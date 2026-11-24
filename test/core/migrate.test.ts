@@ -1,4 +1,6 @@
-import { mkdtempSync, writeFileSync, rmSync, readFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, readFileSync, readdirSync, copyFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import * as sqliteVec from "sqlite-vec";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import BetterSqlite3 from "better-sqlite3";
@@ -9,7 +11,7 @@ import { openDb } from "../../src/core/db.js";
 test("openDb applies all migrations and records them", () => {
   const db = openDb(":memory:");
   const names = (db.prepare(`SELECT name FROM _migrations ORDER BY name`).all() as { name: string }[]).map((r) => r.name);
-  expect(names).toEqual(["001_init.sql", "002_pages.sql", "003_authored_at.sql", "004_chunk_title.sql", "005_embed_provenance.sql", "006_snapshots.sql", "007_snapshot_runs.sql", "008_findings.sql", "009_chunk_aliases.sql", "010_drop_alias_embeddings.sql", "011_finding_due.sql", "012_backfill_page_type.sql", "013_finding_doc.sql", "014_stemmed_fts.sql"]);
+  expect(names).toEqual(["001_init.sql", "002_pages.sql", "003_authored_at.sql", "004_chunk_title.sql", "005_embed_provenance.sql", "006_snapshots.sql", "007_snapshot_runs.sql", "008_findings.sql", "009_chunk_aliases.sql", "010_drop_alias_embeddings.sql", "011_finding_due.sql", "012_backfill_page_type.sql", "013_finding_doc.sql", "014_stemmed_fts.sql", "015_page_ingests.sql", "016_chunk_fts_rowids.sql"]);
 });
 
 test("pages-layer tables exist after open", () => {
@@ -83,4 +85,39 @@ test("012 backfills pages.type from frontmatter, and only from a non-empty strin
     absent: null,
     gen: "Report",
   });
+});
+
+test("016 backfills the keyword rowids from the existing FTS rows, so no page reads as stale", async () => {
+  // Build the schema as of 015, seed chunks the old way (no rowid columns),
+  // then let the runner apply only 016 from the real directory.
+  const migrations = new URL("../../migrations/", import.meta.url);
+  const dir = mkdtempSync(join(tmpdir(), "mb-mig-"));
+  try {
+    for (const f of readdirSync(migrations).filter((f) => f.endsWith(".sql") && f < "016")) {
+      copyFileSync(new URL(f, migrations), join(dir, f));
+    }
+    const db = new BetterSqlite3(":memory:");
+    sqliteVec.load(db);
+    migrate(db, dir);
+    db.exec(`INSERT INTO page_chunks (chunk_id, slug, ordinal, heading, text, embedding_model, chunk_scheme)
+             VALUES ('p#0', 'p', 0, NULL, 'a', 'm', 's'), ('p#1', 'p', 1, NULL, 'b', 'm', 's'), ('q#0', 'q', 0, NULL, 'c', 'm', 's')`);
+    for (const t of ["page_chunks_fts", "page_chunks_fts_exact"]) {
+      db.exec(`INSERT INTO ${t} (chunk_id, slug, title, aliases, heading, text)
+               VALUES ('q#0', 'q', 'Q', '', NULL, 'c'), ('p#0', 'p', 'P', '', NULL, 'a'), ('p#1', 'p', 'P', '', NULL, 'b')`);
+    }
+    db.exec(`DELETE FROM page_chunks_fts_exact WHERE chunk_id = 'q#0'`); // lost before the migration
+    migrate(db, fileURLToPath(migrations));
+
+    const rows = db.prepare(`SELECT chunk_id, fts_rowid, exact_rowid FROM page_chunks ORDER BY chunk_id`).all() as
+      { chunk_id: string; fts_rowid: number | null; exact_rowid: number | null }[];
+    for (const r of rows) {
+      expect(db.prepare(`SELECT chunk_id FROM page_chunks_fts WHERE rowid = ?`).get(r.fts_rowid)).toEqual({ chunk_id: r.chunk_id });
+    }
+    expect(rows.find((r) => r.chunk_id === "q#0")?.exact_rowid).toBeNull();
+    for (const r of rows.filter((r) => r.chunk_id !== "q#0")) {
+      expect(db.prepare(`SELECT chunk_id FROM page_chunks_fts_exact WHERE rowid = ?`).get(r.exact_rowid)).toEqual({ chunk_id: r.chunk_id });
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

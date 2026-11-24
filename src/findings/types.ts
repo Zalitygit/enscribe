@@ -66,10 +66,16 @@ export const findingKey = (kind: string, subject: string): string => `${kind}:${
 // password in a raw session note and two truncated fragments of a live token.
 // Removing the line resolves it.
 //
+// `stale` is listed for the same reason as `unknown-link-type`: it fires only
+// on a page that declares the OKF `stale_after` or `verified` field, and none
+// of the vault's 190 pages did when it shipped (measured 2026-10-31), so it
+// cannot be noisy on day one. Re-checking the page and moving the date forward
+// resolves it.
+//
 // Lives here (not in index.ts, where it originates) so callers like
 // src/mcp/server.ts that need only the constant don't pull in the detector
 // functions and their pages/parse dependency chain.
-export const DAEMON_KINDS = ["orphan", "unresolved", "unknown-link-type", "secret"];
+export const DAEMON_KINDS = ["orphan", "unresolved", "unknown-link-type", "secret", "stale"];
 
 // The whitelist counterpart to DAEMON_KINDS: kinds an external
 // findings.report caller (the gardener) is allowed to declare at all.
@@ -96,4 +102,14 @@ export const REPORTABLE_KINDS = ["red-link", "contradiction"];
 // collide with the `rot-stale-todo` detector, which is a dead vault-markdown
 // sweep and must stay dead: reviving it would fire on every open item every
 // night, which is a duplicate nag, not a second opinion.
-export const APPENDABLE_KINDS = ["needs-human", "todo"];
+//
+// `alert` is the third (2026-11-04). It is something happening NOW that the owner
+// should see soon: a service down, an account overdrawn, a deadline today.
+// That is neither a needs-human (an ask only the owner can carry out) nor a todo (his
+// own dated commitment); an alert is a condition, and it closes when the
+// condition does. It is raised and cleared both by sessions (`add_finding`)
+// and by plain scripts and cron jobs (`enscribe findings add`, then
+// `findings resolve`), and a desk panel (wiki page p4-desk-panel, its own
+// repo) shows the open ones as a red banner. Whoever raised it is
+// responsible for clearing it. Nothing sweeps for it, so it cannot flap.
+export const APPENDABLE_KINDS = ["needs-human", "todo", "alert"];

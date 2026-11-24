@@ -12,6 +12,7 @@ const KIND_TITLES: Record<string, string> = {
   orphan: "Orphans",
   unresolved: "Unresolved links",
   "unknown-link-type": "Unknown link types",
+  stale: "Stale pages (verified: too old)",
   "red-link": "Red links (Obsidian)",
   contradiction: "Contradictions",
   "rot-future-date": "Past-dated future claims",
@@ -103,10 +104,11 @@ export const findingsPage: Generator = {
 
     const asks = active.filter((f) => f.kind === "needs-human").sort(byDue);
     const todos = active.filter((f) => f.kind === "todo").sort(byDue);
+    const alerts = active.filter((f) => f.kind === "alert").sort(byDue);
 
     const byKind = new Map<string, Finding[]>();
     for (const f of active) {
-      if (f.kind === "needs-human" || f.kind === "todo") continue;
+      if (f.kind === "needs-human" || f.kind === "todo" || f.kind === "alert") continue;
       byKind.set(f.kind, [...(byKind.get(f.kind) ?? []), f]);
     }
 
@@ -128,6 +130,15 @@ export const findingsPage: Generator = {
       sections.unshift(`## Needs human (${asks.length})\n\n${asks.map(block).join("\n\n")}`);
     }
 
+    // Alerts lead the page, above even the asks (2026-11-04): an alert is a
+    // condition happening now, which is more urgent than any deadline. They
+    // render through todoLine, one line each with newlines collapsed, because
+    // the generic detector path (`line`) keeps newlines, and an alert's detail
+    // is often a script's multi-line output that would emit stray headings.
+    if (alerts.length > 0) {
+      sections.unshift(`## Alerts (${alerts.length})\n\n${alerts.map(todoLine).join("\n")}`);
+    }
+
     const declined = ctx.findings.list({ state: "wont_fix" });
     const declinedSection = declined.length === 0
       ? `## Declined\n\nnone`
@@ -136,10 +147,11 @@ export const findingsPage: Generator = {
 
     const body = `# Brain findings
 
-Needs human holds asks a Claude Code session filed for the owner and cannot clear itself;
+Alerts holds conditions happening now, raised by a session or a script; Needs human
+holds asks a Claude Code session filed for the owner and cannot clear itself;
 Todo holds dated items filed with \`add_finding\`; everything below them is a
 condition the nightly detectors or brain-gardener found. Generated; edit nothing
-here. Close an ask or a todo with \`enscribe findings resolve <key> "reason"\`.
+here. Close an alert, an ask or a todo with \`enscribe findings resolve <key> "reason"\`.
 Page names are in backticks, not wikilinks, on purpose: this page cites missing
 targets and a wikilink to one would fail the generator lint.
 

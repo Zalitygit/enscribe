@@ -7,6 +7,7 @@ import { Store } from "../core/store.js";
 import { SearchService } from "../search/index.js";
 import { createEmbedder, type Embedder, type EmbedderConfig } from "../embed/index.js";
 import { buildServer } from "./server.js";
+import { formatCallLog } from "./call-log.js";
 import { resolveContextPath } from "../config.js";
 import { bearerToken, type Tokens } from "./auth.js";
 import { PagesStore } from "../pages/store.js";
@@ -14,6 +15,7 @@ import { PageService } from "../pages/service.js";
 import { loadVaultConfig } from "../pages/vault-config.js";
 import type { VaultConfig } from "../pages/vault-config.js";
 import { FindingsStore } from "../findings/ledger.js";
+import { buildViewHandler } from "../view/handler.js";
 
 interface Session {
   transport: StreamableHTTPServerTransport;
@@ -82,8 +84,12 @@ export function buildHttpHandler(deps: {
     for (const [sid, s] of sessions) if (s.lastSeen < cutoff) dropSession(sid);
   }, Math.min(limits.sessionTtlMs, 5 * 60 * 1000));
   sweep.unref();
+  // The read-only page viewer (/view, src/view/handler.ts) shares the port
+  // and the tokens file.
+  const view = buildViewHandler({ pages, findings, tokens });
 
   return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    if (view(req, res)) return;
     const url = new URL(req.url ?? "/", "http://localhost");
     if (url.pathname !== "/mcp") return rpcError(res, 404, "not found");
 
@@ -143,7 +149,11 @@ export function buildHttpHandler(deps: {
         transport.onclose = () => {
           if (transport.sessionId) sessions.delete(transport.sessionId);
         };
-        const server = buildServer({ store, search, pages, service, vaultConfig, findings, contextPath: resolveContextPath() }, client.scopes);
+        const server = buildServer({
+          store, search, pages, service, vaultConfig, findings, contextPath: resolveContextPath(),
+          // stdout goes to the journal under macbrain-serve.
+          onToolCall: (e) => console.log(formatCallLog(client.name, e)),
+        }, client.scopes);
         await server.connect(transport);
       } else if (sessionId) {
         // A non-initialize call on a session id we don't know: restarted,

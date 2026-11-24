@@ -7,6 +7,12 @@ test("todo is appendable", () => {
   expect(APPENDABLE_KINDS).toContain("todo");
 });
 
+// An alert is filed by whatever noticed the condition (a session or a cron
+// script) and cleared by hand or by that same script; nothing sweeps for it.
+test("alert is appendable", () => {
+  expect(APPENDABLE_KINDS).toContain("alert");
+});
+
 // The load-bearing invariant. A kind that a reconciling source also claims
 // produces a row the next nightly reconcile resolves having never detected
 // it, and the pair flaps open/resolved forever. Asserted over all three

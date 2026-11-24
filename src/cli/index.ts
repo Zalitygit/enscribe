@@ -15,6 +15,7 @@ import { PageService } from "../pages/service.js";
 import { FindingsStore } from "../findings/ledger.js";
 import type { FindingState } from "../findings/types.js";
 import { runDetection } from "../findings/index.js";
+import { appendFinding } from "../findings/append.js";
 import { backfillFromArchive } from "../findings/backfill.js";
 import { loadVaultConfig } from "../pages/vault-config.js";
 import { normalize, slugify } from "../pages/slug.js";
@@ -187,8 +188,12 @@ export async function run(argv: string[]): Promise<number> {
     }
     case "reindex": {
       const { search } = services();
-      const { records } = await search.reindexAll();
+      const { records, failed } = await search.reindexAll();
       console.log(`reindexed ${records} current record(s)`);
+      if (failed.length) {
+        console.log(`embedding failed for ${failed.length} record(s); keyword index is complete, prior vectors kept`);
+        return 1;
+      }
       return 0;
     }
     case "doctor": {
@@ -227,6 +232,58 @@ export async function run(argv: string[]): Promise<number> {
             return 1;
           }
           console.log(`${state} ${key}`);
+          return 0;
+        }
+        // `findings add <kind> <subject> <detail> [--due D] [--doc slug]` is
+        // the add_finding write path from a terminal (2026-11-04), so cron
+        // scripts on the brain host can raise an `alert` for the desk panel and clear
+        // it with `resolve` when the condition goes away. It goes through
+        // appendFinding, the same kind whitelist and normalizers as the MCP
+        // tool, and like `resolve` it must not run the detector sweep.
+        if (rest[0] === "add") {
+          const usage = "usage: enscribe findings add <kind> <subject> <detail|-> [--due YYYY-MM-DD|ISO] [--doc slug]";
+          const due = flag(rest, "due");
+          const doc = flag(rest, "doc");
+          // Positionals are what is left once each flag and its value are
+          // taken out, so the flags may come anywhere on the line.
+          const flagAt = new Set<number>();
+          for (const name of ["due", "doc"]) {
+            const i = rest.indexOf(`--${name}`);
+            if (i >= 0) { flagAt.add(i); flagAt.add(i + 1); }
+          }
+          const pos = rest.slice(1).filter((_, i) => !flagAt.has(i + 1));
+          // Exactly three. An unquoted detail arrives as many words, and one
+          // with a ';' in it has already lost its tail to the shell, so
+          // joining the words would file a truncated handoff and report
+          // success. Refuse and say how to pass it.
+          if (pos.length !== 3 || (rest.includes("--due") && due === undefined) || (rest.includes("--doc") && doc === undefined)) {
+            console.error(usage);
+            console.error("quote the detail as one argument, or pass - and pipe it on stdin");
+            return 1;
+          }
+          const [kind, subject, detailArg] = pos;
+          // `-` reads the detail from stdin, so a script can pipe or heredoc
+          // a multi-line handoff without shell-quoting it (the owner's text often
+          // holds a ';'). Trailing newlines are dropped: a heredoc or `echo`
+          // always adds one, and it is not part of the detail.
+          let detail = detailArg;
+          if (detailArg === "-") {
+            const chunks: Buffer[] = [];
+            for await (const c of process.stdin) chunks.push(Buffer.from(c));
+            detail = Buffer.concat(chunks).toString("utf8").replace(/\n+$/, "");
+          }
+          let wrote: ReturnType<typeof appendFinding>;
+          try {
+            wrote = appendFinding(findings, { kind, subject, detail, due, doc }, "cli", new Date().toISOString());
+          } catch (e) {
+            console.error((e as Error).message);
+            return 1;
+          }
+          // The same facts add_finding returns, as lines a script can grep.
+          console.log(wrote.created ? `created ${wrote.key}` : `re-filed ${wrote.key} (times_reported ${wrote.times_reported})`);
+          if (wrote.reopened) console.log(`reopened ${wrote.key} (it had been resolved)`);
+          if (doc && !pages.resolve(doc)) console.log(`doc ${doc} (NO SUCH PAGE yet)`);
+          for (const k of wrote.similar) console.log(`similar ${k}`);
           return 0;
         }
         // `show` and `list` are the READ path, and like `resolve` they must not

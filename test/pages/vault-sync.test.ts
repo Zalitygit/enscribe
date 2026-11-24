@@ -133,7 +133,7 @@ test("a file whose slug changes tombstones the old slug", async () => {
   expect(store.getPage("bin-toolkit")?.deleted_at).toBeNull();
   writeFileSync(join(root, "raw/readme.md"), "# Toolkit\n");
   const s = await syncVault(cfg(), svc, store, read);
-  expect(s.pruned).toBe(1);
+  expect(s.pruned).toBe(0); // retired by ingest itself (same source_path), so the prune finds nothing
   expect(store.getPage("bin-toolkit")?.deleted_at).not.toBeNull();
   expect(store.getPage("readme")?.deleted_at).toBeNull();
 });
@@ -231,4 +231,21 @@ test("a completed sync stamps the last-sync time, which pageHealth reports", asy
   await syncVault(cfg(), svc, store, read, fsLister, () => new Map());
   const stamped = store.pageHealth().lastVaultSync;
   expect(stamped).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+});
+
+// A sync that prunes a vanished file must also cancel an ingest of that file
+// still in flight (serve's put_page, a watcher), or its late embedding revives it.
+test("pruning a vanished file cancels an in-flight ingest of it", async () => {
+  await syncVault(cfg(), svc, store, read);
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  const inner = new FakeEmbedder();
+  const held = new FakeEmbedder();
+  held.embed = async (t, k) => { await gate; return inner.embed(t, k); };
+  const pending = new PageService(db, store, held).ingest("wiki/concepts/beta.md", "---\ntitle: Beta\n---\n# Beta\nedited\n");
+  rmSync(join(root, "wiki/concepts/beta.md"));
+  expect((await syncVault(cfg(), svc, store, read)).pruned).toBe(1);
+  release();
+  await pending;
+  expect(store.getPage("beta")?.deleted_at).not.toBeNull();
 });

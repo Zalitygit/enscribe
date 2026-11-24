@@ -156,6 +156,20 @@ export class Store {
     );
   }
 
+  // Remove the text-side derived rows (FTS, relationships) only. Reindex uses
+  // this so the vector side can be replaced per record as embeddings succeed.
+  clearTextIndexes(): void {
+    this.db.exec("DELETE FROM records_fts; DELETE FROM relationships;");
+  }
+
+  // Drop vector + embedding-metadata rows that do not back a current record.
+  pruneNonCurrentVectors(): void {
+    this.db.exec(
+      "DELETE FROM vec_records WHERE record_id NOT IN (SELECT id FROM current_records);" +
+      "DELETE FROM embeddings WHERE record_id NOT IN (SELECT id FROM current_records);",
+    );
+  }
+
   // Re-populate the text-side derived indexes (FTS + relationships) for an existing
   // canonical record, without creating a new version. Used by reindex (the vector
   // side is rebuilt by SearchService.index).

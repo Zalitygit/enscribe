@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>enscribe viewer</title>
+  <link rel="stylesheet" href="/view/app.css">
+  <script type="module" src="/view/app.js"></script>
+</head>
+<body>
+  <header>
+    <span class="brand">enscribe</span>
+    <input id="find" type="search" placeholder="Search pages (end with / for whole words)" list="titles" autocomplete="off">
+    <datalist id="titles"></datalist>
+    <button id="home" type="button" title="Back to the most-linked page (h)">Home</button>
+    <button id="demo" type="button" title="Watch a read-only gardener pass: no LLM, nothing written (Space pauses, → skips, Esc stops)">Watch the gardener</button>
+    <select id="demo-speed" title="Tour speed (can change mid-tour)" aria-label="Tour speed"></select>
+    <select id="demo-length" title="Pages per tour" aria-label="Pages per tour"></select>
+    <span id="status"></span>
+    <button id="forget" type="button" title="Remove the token from this browser">Forget token</button>
+  </header>
+  <main>
+    <svg id="disk" viewBox="-1.04 -1.04 2.08 2.08" role="img" aria-label="Hyperbolic map of pages"></svg>
+    <ol id="demo-log" hidden aria-live="polite"></ol>
+    <aside id="panel" hidden>
+      <button id="close" type="button" title="Close (Esc)">×</button>
+      <div id="page"></div>
+    </aside>
+  </main>
+  <dialog id="login">
+    <form id="login-form" method="dialog">
+      <p>Paste a token with <code>pages.read</code>. It is kept in this browser's local storage and sent only to this site.</p>
+      <input id="token" type="password" autocomplete="off" required>
+      <p id="login-error"></p>
+      <button type="submit">Open</button>
+    </form>
+  </dialog>
+</body>
+</html>

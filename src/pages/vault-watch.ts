@@ -15,11 +15,23 @@ export interface WatchHandle {
 export interface WatchOptions {
   debounceMs?: number;
   onError?: (path: string, err: Error) => void;
+  read?: (absPath: string) => string;
 }
 
-// Baseline full-sync, then a debounced watch of the include dirs. add/change ->
-// ingest; unlink -> soft-delete by source_path; each debounced batch ends with
-// resolveAll(). Resolves once the watcher's initial scan is ready.
+// A debounced watch of the include dirs plus a baseline full sync. add/change ->
+// ingest; unlink -> retire by source_path; each debounced batch ends with
+// resolveAll(), and batches run one at a time. Resolves once the baseline sync
+// is done.
+//
+// The watcher starts BEFORE the sync and holds its events until the sync is
+// done, then processes them. Sync-then-watch missed any edit landing after the
+// sync listed the vault and before the watcher was up: with ignoreInitial the
+// watcher's scan took the file as already present, so it stayed stale until
+// the next full sync. A held event for a file the sync already ingested is a
+// no-op re-ingest. Residual: on macOS `ready` precedes the OS watch going live
+// by tens of ms (measured 2026-10-31), so an edit the sync has already read,
+// made inside that window, can still be missed. Closing that needs a probe
+// write in every watched directory, which a live vault should not get.
 export async function watchVault(
   config: VaultConfig,
   service: PageService,
@@ -28,7 +40,6 @@ export async function watchVault(
 ): Promise<WatchHandle> {
   const debounceMs = opts.debounceMs ?? 300;
   const onError = opts.onError ?? ((p: string, e: Error) => console.error(`[vault-watch] ${p}: ${e.message}`));
-  await syncVault(config, service, store, (abs) => readFileSync(abs, "utf8"));
 
   const denies = config.deny.map((d) => d.toLowerCase());
   const roots = config.include.map((rel) => join(config.root, rel));
@@ -39,16 +50,26 @@ export async function watchVault(
   const pending = new Map<string, "upsert" | "remove">();
   let timer: ReturnType<typeof setTimeout> | null = null;
 
-  const flush = async (): Promise<void> => {
+  // One batch at a time. Events that arrive while a batch is awaiting an
+  // embedding wait in `pending` for the next one: a second batch running
+  // alongside could let the first one's stale remove undo the second's add.
+  let active: Promise<void> | null = null;
+  const drain = async (): Promise<void> => {
+    while (pending.size) await flush();
+  };
+  const kick = () => {
     timer = null;
+    if (!active) active = drain().finally(() => { active = null; });
+  };
+
+  const flush = async (): Promise<void> => {
     const batch = [...pending];
     pending.clear();
     for (const [abs, kind] of batch) {
       const rel = relative(config.root, abs);
       try {
         if (kind === "remove") {
-          const page = store.getBySourcePath(rel);
-          if (page) store.softDelete(page.slug);
+          service.retire(rel);
         } else {
           const raw = readFileSync(abs, "utf8");
           // Single-file mirror of the full sync's collision quarantine. Slug is
@@ -75,9 +96,12 @@ export async function watchVault(
     }
   };
 
+  // Held until the baseline sync finishes, so a flush never runs beside it.
+  let holding = true;
   const schedule = () => {
+    if (holding) return;
     if (timer) clearTimeout(timer);
-    timer = setTimeout(() => { void flush(); }, debounceMs);
+    timer = setTimeout(kick, debounceMs);
   };
   const onUpsert = (abs: string) => { if (abs.endsWith(".md")) { pending.set(abs, "upsert"); schedule(); } };
   const onRemove = (abs: string) => { if (abs.endsWith(".md")) { pending.set(abs, "remove"); schedule(); } };
@@ -85,10 +109,23 @@ export async function watchVault(
   watcher.on("add", onUpsert).on("change", onUpsert).on("unlink", onRemove);
   await new Promise<void>((res) => watcher.once("ready", () => res()));
 
+  try {
+    await syncVault(config, service, store, opts.read ?? ((abs) => readFileSync(abs, "utf8")));
+  } catch (err) {
+    await watcher.close();
+    throw err;
+  }
+  holding = false;
+  if (pending.size) schedule();
+
   return {
+    // Stops new events, then drains: the batch in progress and any events
+    // still pending are applied before close resolves.
     close: async () => {
       if (timer) clearTimeout(timer);
       await watcher.close();
+      if (pending.size) kick();
+      await active;
     },
   };
 }

@@ -1,5 +1,5 @@
 import "./node-guard.js"; // must precede the better-sqlite3 import (fails fast on unsupported Node)
-import { readFileSync, readdirSync, mkdirSync } from "node:fs";
+import { readFileSync, readdirSync, mkdirSync, openSync, closeSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import BetterSqlite3 from "better-sqlite3";
@@ -36,7 +36,14 @@ export function migrate(db: Database, dir = MIGRATIONS_DIR): void {
 export function openDb(path: string): Database {
   // Ensure the parent directory exists for a file-based DB, so every entry point
   // (CLI, MCP server) can open a fresh path without pre-creating the dir.
-  if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
+  // Directories and the DB file this call creates are private (0700/0600), as
+  // backup.ts does, rather than whatever the umask allows; SQLite gives the
+  // -wal/-shm sidecars the DB file's mode. Existing dirs and files keep theirs,
+  // so an operator-supplied shared parent is never chmod'ed.
+  if (path !== ":memory:") {
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    createPrivateFile(path);
+  }
   const db = new BetterSqlite3(path);
   db.pragma("journal_mode = WAL");
   db.pragma("busy_timeout = 5000");
@@ -44,4 +51,15 @@ export function openDb(path: string): Database {
   sqliteVec.load(db);
   migrate(db);
   return db;
+}
+
+// Create `path` 0600 if it does not exist. The exclusive create is the check:
+// two processes opening one missing path can both see it absent, and the one
+// that loses gets EEXIST and opens the winner's file. Any other error throws.
+export function createPrivateFile(path: string): void {
+  try {
+    closeSync(openSync(path, "wx", 0o600));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+  }
 }

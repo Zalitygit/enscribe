@@ -245,3 +245,18 @@ test("collapses a newline in a todo's detail to a single space", async () => {
   expect(page.body).toContain("line one ## fake heading");
   expect(page.body).not.toMatch(/^## fake heading/m);
 });
+
+// An alert is happening now, so it leads the page, above even the asks. Left
+// to the generic detector path it would render through `line()`, which does
+// not collapse newlines, and a script's multi-line detail would emit headings.
+test("renders alerts first, one line each, newlines collapsed", async () => {
+  findings.add({ kind: "needs-human", subject: "codex-reauth", detail: "re-auth" }, "session", "2026-08-16T00:00:00Z");
+  findings.add({ kind: "alert", subject: "mail-down", detail: "SMTP refused\n## fake heading" },
+    "cli", "2026-11-04T00:00:00Z");
+  const [page] = await findingsPage.run(ctx());
+  expect(page.body).toContain("## Alerts (1)");
+  expect(page.body.indexOf("## Alerts")).toBeLessThan(page.body.indexOf("## Needs human"));
+  expect(page.body).toContain("SMTP refused ## fake heading");
+  expect(page.body).not.toMatch(/^## fake heading/m);
+  expect(page.body).not.toContain("## alert");
+});

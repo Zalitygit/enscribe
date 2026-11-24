@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Readable } from "node:stream";
 import { run } from "../../src/cli/index.js";
 import { openDb } from "../../src/core/db.js";
 import { FindingsStore } from "../../src/findings/ledger.js";
@@ -226,6 +227,70 @@ test("findings list --state all includes resolved items", async () => {
   out.length = 0;
   await run(["findings", "list", "--state", "all"]);
   expect(out.join("\n")).toContain("closed");
+});
+
+// --- `findings add`: filing from a script ----------------------------------
+//
+// Added 2026-11-04 so a cron job on the brain host can raise and clear an `alert`
+// without a Claude session. It is the add_finding write path from a terminal:
+// same kind whitelist, same normalizers, no detector sweep.
+
+const stdinOf = (text: string) => {
+  vi.spyOn(process, "stdin", "get").mockReturnValue(Readable.from([text]) as unknown as typeof process.stdin);
+};
+
+test("findings add files a row with source cli and does not run detection", async () => {
+  expect(await run(["findings", "add", "alert", "mail-down", "mail SMTP down", "--due", "2026-11-04"])).toBe(0);
+  expect(out.join("\n")).toContain("created alert:mail-down");
+  expect(out.join("\n")).not.toMatch(/findings: \d+ new/);
+  const check = openDb(process.env.MACBRAIN_DB!);
+  expect(new FindingsStore(check).get("alert:mail-down")).toMatchObject({
+    kind: "alert", state: "open", source: "cli", detail: "mail SMTP down", due: "2026-11-04T23:59:59Z",
+  });
+  check.close();
+});
+
+test("findings add refuses a non-appendable kind and writes nothing", async () => {
+  expect(await run(["findings", "add", "orphan", "a", "d"])).toBe(1);
+  expect(errOut.join("\n")).toContain("not appendable");
+  const check = openDb(process.env.MACBRAIN_DB!);
+  expect(new FindingsStore(check).get("orphan:a")).toBeUndefined();
+  check.close();
+});
+
+test("findings add rejects a bad due date and writes nothing", async () => {
+  expect(await run(["findings", "add", "alert", "a", "d", "--due", "tomorrow"])).toBe(1);
+  expect(errOut.join("\n")).toContain("YYYY-MM-DD");
+  const check = openDb(process.env.MACBRAIN_DB!);
+  expect(new FindingsStore(check).get("alert:a")).toBeUndefined();
+  check.close();
+});
+
+// A script pipes the detail so the shell never sees it: the owner's text often holds
+// a ';', which unquoted ends the command and files half the detail.
+test("findings add with detail '-' reads it from stdin, lines and ';' intact", async () => {
+  stdinOf("balance below zero; check it\n\n  ssh brainhost 'ledger balance'\n");
+  expect(await run(["findings", "add", "alert", "overdrawn", "-", "--doc", "p4-desk-panel"])).toBe(0);
+  const check = openDb(process.env.MACBRAIN_DB!);
+  expect(new FindingsStore(check).get("alert:overdrawn")).toMatchObject({
+    detail: "balance below zero; check it\n\n  ssh brainhost 'ledger balance'", doc: "p4-desk-panel",
+  });
+  check.close();
+});
+
+test("findings add re-filing the same subject reports times_reported 2", async () => {
+  await run(["findings", "add", "alert", "mail-down", "first"]);
+  out.length = 0;
+  expect(await run(["findings", "add", "alert", "mail-down ", "second"])).toBe(0);
+  expect(out.join("\n")).toContain("re-filed alert:mail-down (times_reported 2)");
+  const check = openDb(process.env.MACBRAIN_DB!);
+  expect(new FindingsStore(check).get("alert:mail-down")).toMatchObject({ detail: "second", times_reported: 2 });
+  check.close();
+});
+
+test("findings add with too few arguments exits 1 with usage", async () => {
+  expect(await run(["findings", "add", "alert", "a"])).toBe(1);
+  expect(errOut.join("\n")).toContain("usage: enscribe findings add");
 });
 
 // --- `doc`: the pointer, and the read-side check it buys -------------------

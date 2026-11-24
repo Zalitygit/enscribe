@@ -130,3 +130,55 @@ test("get_page of a tombstoned page is not_found and never suggests the tombston
   expect(JSON.stringify(r)).not.toContain("sensitive");
   expect(r.suggestions).not.toContain("secret");
 });
+
+// The point of a hit's `section`: passed back unchanged, get_page serves that
+// section rather than the whole page.
+test("a search hit's section round-trips through get_page", async () => {
+  const c = await client();
+  const s = textOf(await c.callTool({ name: "search", arguments: { query: "Alpha child ac" } }));
+  const hit = s.hits.find((h: any) => h.kind === "page" && h.slug === "sectioned");
+  expect(hit.section).toBeDefined();
+  const r = textOf(await c.callTool({ name: "get_page", arguments: { slug: hit.slug, section: hit.section } }));
+  expect(r.section).toBe(hit.section);
+  expect(r.body.length).toBeLessThan(SECTIONED.length);
+});
+
+// get_pages: several get_page reads in one call, like claude-mem's
+// get_observations(ids). The call log showed about 2.8 get_page calls per
+// search on 2026-11-24, each a separate round trip.
+test("get_pages returns each request in order, with get_page's shape per item", async () => {
+  const r = textOf(await (await client()).callTool({ name: "get_pages", arguments: { pages: [
+    { slug: "sectioned", section: "beta" },
+    { slug: "no-such-page" },
+    { slug: "sectioned" },
+  ] } }));
+  expect(r.pages).toHaveLength(3);
+  expect(r.pages[0]).toEqual({ slug: "sectioned", title: "Sectioned", section: "Beta", body: "## Beta\nb\n" });
+  expect(r.pages[1].error).toBe("not_found");
+  expect(r.pages[2].body).toBe(SECTIONED);
+});
+
+// Ten whole 50 KB pages in one reply would blow any client's tool-output cap,
+// so the batch shares one body budget (PAGE_MAX_CHARS) across its items, in
+// order; an item past it is cut like an over-cap get_page, with the outline.
+test("get_pages shares one body budget across the batch", async () => {
+  const r = textOf(await (await client()).callTool({ name: "get_pages", arguments: { pages: [
+    { slug: "huge", section: "one" },
+    { slug: "huge" },
+  ] } }));
+  const total = r.pages.reduce((n: number, p: any) => n + p.body.length, 0);
+  expect(total).toBeLessThanOrEqual(60_000);
+  expect(r.pages[0].body.length).toBeGreaterThan(40_000);
+  expect(r.pages[1].truncated).toBe(true);
+  expect(r.pages[1].sections.map((s: any) => s.heading)).toEqual(["Big", "One", "Two"]);
+});
+
+test("get_pages refuses more than 10 requests", async () => {
+  const pages = Array.from({ length: 11 }, () => ({ slug: "sectioned" }));
+  const c = await client();
+  const r: any = await c.callTool({ name: "get_pages", arguments: { pages } });
+  expect(r.isError).toBe(true);
+  // The tool exists, so the refusal is the size limit, not "tool not found".
+  const ok = textOf(await c.callTool({ name: "get_pages", arguments: { pages: pages.slice(0, 10) } }));
+  expect(ok.pages).toHaveLength(10);
+});

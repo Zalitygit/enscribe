@@ -75,9 +75,84 @@ export class PagesStore {
     return r?.slug;
   }
 
+  // Live slugs other than `slug` still claiming `sourcePath`: what a file
+  // leaves behind when its frontmatter slug changes in place.
+  formerSlugsOf(sourcePath: string, slug: string): string[] {
+    return (this.db.prepare(
+      `SELECT slug FROM pages WHERE source_path = ? AND slug <> ? AND deleted_at IS NULL`,
+    ).all(sourcePath, slug) as { slug: string }[]).map((r) => r.slug);
+  }
+
+  // Pages holding a resolved link to any of `slugs`.
+  linkersOf(slugs: string[]): string[] {
+    if (slugs.length === 0) return [];
+    return (this.db.prepare(
+      `SELECT DISTINCT from_slug FROM page_links WHERE to_slug IN (${slugs.map(() => "?").join(",")})`,
+    ).all(...slugs) as { from_slug: string }[]).map((r) => r.from_slug);
+  }
+
+  // In-flight ingest tickets (migration 015). A newer ingest of a path cancels
+  // every older one; an ingest whose ticket is gone must not commit.
+  beginIngest(sourcePath: string): number {
+    return this.db.transaction(() => {
+      const id = Number(this.db.prepare(`INSERT INTO page_ingests (source_path) VALUES (?)`).run(sourcePath).lastInsertRowid);
+      this.db.prepare(`DELETE FROM page_ingests WHERE source_path = ? AND id < ?`).run(sourcePath, id);
+      return id;
+    }).immediate();
+  }
+
+  ingestIsCurrent(id: number): boolean {
+    return this.db.prepare(`SELECT 1 FROM page_ingests WHERE id = ?`).get(id) !== undefined;
+  }
+
+  endIngest(id: number): void {
+    this.db.prepare(`DELETE FROM page_ingests WHERE id = ?`).run(id);
+  }
+
+  // Cancel every ingest of `sourcePath` in flight now. Reads first, so the
+  // common case (nothing in flight) takes no write lock; deleting only ids
+  // already seen leaves alone an ingest that starts in between, which is newer.
+  cancelIngests(sourcePath: string): void {
+    const r = this.db.prepare(`SELECT MAX(id) AS id FROM page_ingests WHERE source_path = ?`).get(sourcePath) as { id: number | null };
+    if (r.id !== null) this.db.prepare(`DELETE FROM page_ingests WHERE source_path = ? AND id <= ?`).run(sourcePath, r.id);
+  }
+
   listPages(): PageRow[] {
     const rows = this.db.prepare(`SELECT * FROM pages WHERE deleted_at IS NULL ORDER BY slug`).all() as RawPage[];
     return rows.map((r) => this.hydrate(r));
+  }
+
+  // Live pages whose chunks, taken together, hold every term of `query`, on
+  // the stemmed keyword index with the term's last word as a prefix, or the
+  // same prefix on the unstemmed one (a word typed past its stem, irriga for
+  // irrigation, matches no stem); with `word`, as whole words exactly, on the
+  // unstemmed one. A term is a
+  // whitespace-separated run or a "quoted" one, read as its words; a term of
+  // two or more (needs-human, "git push") is an FTS5 phrase, its words adjacent
+  // and in order. Each term is matched on its own and the slugs intersected,
+  // so terms may sit in different chunks of one page. Only letters and digits
+  // reach MATCH, so no FTS5 syntax gets through.
+  slugsMatchingText(query: string, { word = false }: { word?: boolean } = {}): string[] {
+    const terms = [...query.matchAll(/"([^"]*)"|(\S+)/g)]
+      .map((m) => (m[1] ?? m[2])!.match(/[\p{L}\p{N}]+/gu) ?? [])
+      .filter((ws) => ws.length)
+      .map((ws) => ws.join(" "));
+    if (!terms.length) return [];
+    const matcher = (table: string) => this.db.prepare(
+      `SELECT DISTINCT f.slug FROM ${table} f JOIN pages p ON p.slug = f.slug
+       WHERE ${table} MATCH ? AND p.deleted_at IS NULL`);
+    const exact = matcher("page_chunks_fts_exact");
+    const stemmed = matcher("page_chunks_fts");
+    const slugs = (stmt: ReturnType<typeof matcher>, m: string) => (stmt.all(m) as { slug: string }[]).map((r) => r.slug);
+    const hits = (t: string) => word ? slugs(exact, `"${t}"`)
+      : [...new Set([...slugs(stemmed, `"${t}"*`), ...slugs(exact, `"${t}"*`)])];
+    let out = hits(terms[0]!);
+    for (const t of terms.slice(1)) {
+      if (!out.length) break;
+      const more = new Set(hits(t));
+      out = out.filter((s) => more.has(s));
+    }
+    return out.sort();
   }
 
   upsertPage(input: PageInput): { row: PageRow; changed: boolean } {
@@ -286,19 +361,27 @@ export class PagesStore {
       this.db.prepare(`DELETE FROM page_chunks WHERE slug = ?`).run(slug);
 
       const insC = this.db.prepare(
-        `INSERT INTO page_chunks (chunk_id, slug, ordinal, heading, text, embedding_model, chunk_scheme)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO page_chunks (chunk_id, slug, ordinal, heading, text, embedding_model, chunk_scheme, fts_rowid, exact_rowid)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       );
       const insF = this.db.prepare(`INSERT INTO page_chunks_fts (chunk_id, slug, title, aliases, heading, text) VALUES (?, ?, ?, ?, ?, ?)`);
       const insE = this.db.prepare(`INSERT INTO page_chunks_fts_exact (chunk_id, slug, title, aliases, heading, text) VALUES (?, ?, ?, ?, ?, ?)`);
       const insV = this.db.prepare(`INSERT INTO vec_page_chunks (chunk_id, embedding) VALUES (?, ?)`);
       for (const c of chunks) {
         const chunkId = `${slug}#${c.ordinal}`;
-        insC.run(chunkId, slug, c.ordinal, c.heading, c.text, provenance.model, provenance.scheme);
-        insF.run(chunkId, slug, title, aliasText, c.heading, c.text);
-        insE.run(chunkId, slug, title, aliasText, c.heading, c.text);
+        // A vector whose page_chunks row was lost is invisible to the delete
+        // above; chunk ids are deterministic, so clear this one by id.
+        delVec.run(chunkId);
+        // The keyword rows' rowids are kept on the chunk row: chunk_id and slug
+        // are UNINDEXED in FTS5, so rowid is the only cheap way back to them.
+        const ftsRowid = insF.run(chunkId, slug, title, aliasText, c.heading, c.text).lastInsertRowid;
+        const exactRowid = insE.run(chunkId, slug, title, aliasText, c.heading, c.text).lastInsertRowid;
+        insC.run(chunkId, slug, c.ordinal, c.heading, c.text, provenance.model, provenance.scheme, ftsRowid, exactRowid);
         insV.run(chunkId, new Uint8Array(c.embedding.buffer, c.embedding.byteOffset, c.embedding.byteLength));
       }
+      // Leftover vectors past the new count (their chunk rows lost, so the
+      // delete above missed them). Ordinals were written contiguously.
+      for (let n = chunks.length; delVec.run(`${slug}#${n}`).changes > 0; n++);
     });
     tx.immediate();
   }
@@ -310,6 +393,30 @@ export class PagesStore {
   updateChunkAliases(slug: string, aliases: string[]): void {
     this.db.prepare(`UPDATE page_chunks_fts SET aliases = ? WHERE slug = ?`).run(aliases.join(" "), slug);
     this.db.prepare(`UPDATE page_chunks_fts_exact SET aliases = ? WHERE slug = ?`).run(aliases.join(" "), slug);
+  }
+
+  // True when a slug's derived chunk rows are exactly what a fresh write would
+  // leave: `expected` chunks, all stamped with this model and scheme, each with
+  // a row in both keyword tables and the vector table. Anything else means the
+  // rows are stale or partly lost, and an unchanged page must be rebuilt rather
+  // than skipped, or vault sync could never heal it.
+  // Runs for every unchanged page on every sync, so every lookup is indexed:
+  // the keyword rows by the rowids replaceChunks stored (a slug filter on an
+  // FTS5 table reads the whole table). An extra keyword row for the slug is not
+  // detected; every write path deletes by slug before inserting.
+  chunksIntact(slug: string, expected: number, provenance: { model: string; scheme: string }): boolean {
+    const rows = this.db.prepare(
+      `SELECT chunk_id, fts_rowid, exact_rowid FROM page_chunks WHERE slug = ? AND embedding_model = ? AND chunk_scheme = ?`,
+    ).all(slug, provenance.model, provenance.scheme) as { chunk_id: string; fts_rowid: number | null; exact_rowid: number | null }[];
+    const all = (this.db.prepare(`SELECT count(*) AS c FROM page_chunks WHERE slug = ?`).get(slug) as { c: number }).c;
+    if (rows.length !== expected || all !== expected) return false;
+    const fts = this.db.prepare(`SELECT 1 FROM page_chunks_fts WHERE rowid = ? AND chunk_id = ?`);
+    const exact = this.db.prepare(`SELECT 1 FROM page_chunks_fts_exact WHERE rowid = ? AND chunk_id = ?`);
+    const vec = this.db.prepare(`SELECT 1 FROM vec_page_chunks WHERE chunk_id = ?`);
+    return rows.every((r) => fts.get(r.fts_rowid, r.chunk_id) !== undefined
+        && exact.get(r.exact_rowid, r.chunk_id) !== undefined
+        && vec.get(r.chunk_id) !== undefined)
+      && vec.get(`${slug}#${expected}`) === undefined;
   }
 
   // Chunk counts grouped by the model + scheme that produced them. One row means
@@ -625,6 +732,18 @@ export class PagesStore {
     return this.db.prepare(
       `SELECT slug, source_path FROM pages WHERE deleted_at IS NULL AND source_path IS NOT NULL ORDER BY slug`,
     ).all() as { slug: string; source_path: string }[];
+  }
+
+  // Every resolved link between two live pages, one row per ordered pair,
+  // self-links dropped. The viewer's whole graph in one query.
+  liveLinks(): [string, string][] {
+    const rows = this.db.prepare(
+      `SELECT DISTINCT l.from_slug AS f, l.to_slug AS t FROM page_links l
+       JOIN pages a ON a.slug = l.from_slug AND a.deleted_at IS NULL
+       JOIN pages b ON b.slug = l.to_slug AND b.deleted_at IS NULL
+       WHERE l.from_slug <> l.to_slug ORDER BY f, t`,
+    ).all() as { f: string; t: string }[];
+    return rows.map((r) => [r.f, r.t]);
   }
 
   // One lookup for a candidate set. Unknown or tombstoned slugs are absent.

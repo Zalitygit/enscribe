@@ -121,6 +121,9 @@ export async function syncVault(
       const path = page.source_path!;
       const renamed = !quarantined.has(path) && slugOfPath.has(path) && slugOfPath.get(path) !== page.slug;
       if (!present.has(path) || renamed) {
+        // A vanished file also cancels any ingest of it in flight elsewhere
+        // (serve's put_page, a watcher), so a late embedding cannot revive it.
+        if (!present.has(path)) store.cancelIngests(path);
         store.softDelete(page.slug);
         pruned++;
       }

@@ -5,7 +5,7 @@ import { PageService } from "../../src/pages/service.js";
 import { FakeEmbedder } from "../../src/embed/fake.js";
 import { detectOrphans, detectUnresolved } from "../../src/findings/detectors.js";
 import { detectRot } from "../../src/findings/detectors.js";
-import { detectUnknownLinkTypes } from "../../src/findings/detectors.js";
+import { detectUnknownLinkTypes, detectStale } from "../../src/findings/detectors.js";
 
 let db: Database;
 let store: PagesStore;
@@ -134,4 +134,64 @@ test("one finding per page and field, counting repeat lines", async () => {
 test("does not flag known types, link-less fields, or fenced fields", async () => {
   await page("svc", "runs-on:: [[hub]]\nstatus:: done\n```\nhosted-on:: [[hub]]\n```");
   expect(detectUnknownLinkTypes(store)).toEqual([]);
+});
+
+// Staleness follows OKF v0.2 (spec/okf.md §5.2, §5.5), which the vault already
+// uses: `stale_after: YYYY-MM-DD` is stale once today >= that date, and when it
+// is absent, `verified` ({ by, at } or a list of them) is stale once its latest
+// `at` is older than the limit. A page with neither is never stale.
+const STALE_NOW = new Date("2026-10-31T12:00:00Z");
+const trustPage = (slug: string, fm: string) =>
+  svc.ingest(`wiki/concepts/${slug}.md`, `---\ntitle: ${slug}\n${fm}\n---\n# ${slug}\n`);
+const stale = () => detectStale(store, STALE_NOW, 180).map((f) => [f.subject, f.detail]);
+
+test("detectStale: stale_after is stale on and after its date", async () => {
+  await trustPage("due-today", "stale_after: 2026-10-31");
+  await trustPage("past", "stale_after: 2026-09-23");
+  await trustPage("later", "stale_after: 2026-11-01");
+  await svc.ingest("wiki/concepts/undeclared.md", "---\ntitle: U\n---\n# U\n");
+  expect(stale()).toEqual([
+    ["due-today", "stale_after 2026-10-31 has passed; re-check the page and move stale_after or verified forward"],
+    ["past", "stale_after 2026-09-23 has passed; re-check the page and move stale_after or verified forward"],
+  ]);
+});
+
+test("detectStale: verified is stale when its latest at is older than the limit", async () => {
+  await trustPage("old", "verified:\n  - { by: human:owner, at: 2026-01-15T09:00:00Z }");
+  await trustPage("rechecked", "verified:\n  - { by: human:owner, at: 2026-01-15T09:00:00Z }\n  - { by: process:nightly, at: 2026-10-01T02:00:00Z }");
+  await trustPage("mapping", "verified: { by: human:owner, at: 2026-02-01 }");
+  await trustPage("edge", "verified: { by: human:owner, at: 2026-05-04 }"); // exactly 180 days
+  expect(stale()).toEqual([
+    ["mapping", "last verified 2026-02-01, older than 180 days; re-check the page and add a verified entry"],
+    ["old", "last verified 2026-01-15, older than 180 days; re-check the page and add a verified entry"],
+  ]);
+});
+
+test("detectStale: a future stale_after decides alone, over an old verified", async () => {
+  await trustPage("vouched", "stale_after: 2027-01-01\nverified: { by: human:owner, at: 2025-01-01 }");
+  expect(stale()).toEqual([]);
+});
+
+test("detectStale reports malformed trust fields instead of skipping them", async () => {
+  await trustPage("bad-date", "stale_after: soon");
+  await trustPage("scalar", "verified: 2026-10-01");
+  await trustPage("no-by", "verified: { at: 2026-10-01 }");
+  await trustPage("bad-at", "verified: [{ by: human:owner, at: 2026-13-01 }]");
+  expect(stale()).toEqual([
+    ["bad-at", "`verified` entries need a by and a valid ISO 8601 at (spec/okf.md §5.2)"],
+    ["bad-date", "`stale_after` is not a YYYY-MM-DD date: soon"],
+    ["no-by", "`verified` entries need a by and a valid ISO 8601 at (spec/okf.md §5.2)"],
+    ["scalar", "`verified` entries need a by and a valid ISO 8601 at (spec/okf.md §5.2)"],
+  ]);
+});
+
+test("detectStale's details do not change from day to day", async () => {
+  await trustPage("old", "verified: { by: human:owner, at: 2026-01-15 }");
+  await trustPage("past", "stale_after: 2026-09-23");
+  expect(detectStale(store, STALE_NOW, 180)).toEqual(detectStale(store, new Date("2026-12-25T00:00:00Z"), 180));
+});
+
+test("detectStale ignores generated pages", async () => {
+  await svc.putGenerated({ slug: "gen", title: "Gen", body: "# Gen\n" }, "test");
+  expect(stale()).toEqual([]);
 });

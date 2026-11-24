@@ -3,6 +3,7 @@ import { type Store, clampLimit } from "../core/store.js";
 import type { MemoryRecord, RecordType } from "../core/types.js";
 import type { Embedder } from "../embed/types.js";
 import { PagesStore, type PageKind } from "../pages/store.js";
+import { splitSections } from "../pages/parse.js";
 import { env } from "../env.js";
 
 export interface SearchHit {
@@ -35,6 +36,15 @@ export type UnifiedHit =
       // alike; these are what let a caller tell the two apart.
       bm25?: number;
       distance?: number;
+      // Heading of the vector leg's best chunk, present only when it differs
+      // from `chunk.heading`. `chunk` is the keyword leg's pick, so a page found
+      // by meaning in another section would otherwise show only the wrong one.
+      vector_heading?: string;
+      // `chunk.heading` as a value get_page's `section` accepts, so the caller
+      // can fetch that section instead of the whole page. Absent when get_page
+      // would not find it: a preamble chunk has no heading, and chunkBody (not
+      // fence-aware) takes a `#` line in a code fence as one.
+      section?: string;
       // Source file's last git-commit time, rename-aware. null means "no
       // authorship date" (a generated page, or a page the vault sync's stamp
       // pass hasn't reached) — never a regen or ingest timestamp.
@@ -77,9 +87,11 @@ export function assessConfidence(hits: UnifiedHit[], floor = DISTANCE_FLOOR): Co
 export const SEARCH_INTENTS = ["factual", "entity", "temporal", "causal", "superseded", "multihop"] as const;
 export type SearchIntent = (typeof SEARCH_INTENTS)[number];
 
-// Which intents actually change retrieval. Only `entity` does. Every other value
-// is accepted so a caller can label its question honestly without having to know
-// which labels are wired up, but they all map to plain RRF.
+// Which intents actually change retrieval. None, since 2026-11-02 (`entity` was
+// the last; see the note on GRAPH_INTENTS). Every value is accepted so a caller
+// can label its question honestly without having to know which labels are wired
+// up, but they all map to plain RRF. The 2026-08-16 readings that first set the
+// list:
 //
 // That list is short because it was MEASURED, not designed. On the 20-query
 // relational benchmark (`qrels-relational.json`), against an identical index:
@@ -99,7 +111,17 @@ export type SearchIntent = (typeof SEARCH_INTENTS)[number];
 //
 // Both rejected legs are still implemented and covered by tests. Re-enabling one
 // is a line here plus a benchmark run, which is the point of keeping the number.
-const GRAPH_INTENTS: ReadonlySet<string> = new Set<SearchIntent>(["entity"]);
+//
+// `entity` was unwired too, 2026-11-02 (docs/evidence/2026-11-02-query-weighted-graph.md).
+// On the production index it had turned from neutral (2026-10-22: entity 0.672
+// -> 0.677) to a loss (0.704 -> 0.599), with code identical. The leg never did
+// what it was for: text hits sit ~0.0007 apart in fused score, a graph slot adds
+// at least 0.0035, and a graph-only page cannot reach the top ten, so all it did
+// was re-rank pages the text legs had found. Seeds are excluded from their own
+// expansion, so the page it lifted depended on which side of the seed cut the
+// answer landed: one corpus shift moved the answer page into the seeds and the
+// boost went to its sibling instead.
+const GRAPH_INTENTS: ReadonlySet<string> = new Set<SearchIntent>([]);
 const RECENCY_INTENTS: ReadonlySet<string> = new Set<SearchIntent>([]);
 
 // How many top-ranked pages seed the neighbourhood expansion, and how many
@@ -149,26 +171,36 @@ export class SearchService {
   private pagesStore: PagesStore;
   private rawWeight: number;
   private generatedWeight: number;
+  // Which intents take the graph leg. Tests set it to keep the unwired leg covered.
+  private graphIntents: ReadonlySet<string>;
   constructor(
     private db: Database, private store: Store, private embedder: Embedder, pagesStore?: PagesStore,
-    opts: { kindWeight?: number; rawWeight?: number; generatedWeight?: number } = {},
+    opts: { kindWeight?: number; rawWeight?: number; generatedWeight?: number; graphIntents?: SearchIntent[] } = {},
   ) {
     this.pagesStore = pagesStore ?? new PagesStore(db);
     this.rawWeight = opts.rawWeight ?? opts.kindWeight ?? RAW_WEIGHT;
     this.generatedWeight = opts.generatedWeight ?? opts.kindWeight ?? GENERATED_WEIGHT;
+    this.graphIntents = opts.graphIntents ? new Set(opts.graphIntents) : GRAPH_INTENTS;
   }
 
   async index(rec: MemoryRecord): Promise<void> {
+    // Prune the version this record supersedes from the derived search indexes,
+    // so only the current version stays searchable (no stale-row bloat or
+    // candidate-pool crowding from old versions). Done before the embed: the
+    // new version is already committed, so the old one is not current even if
+    // the embed below fails.
+    const supersedes = rec.supersedes;
+    if (supersedes) this.db.transaction(() => this.store.deleteFromIndexes([supersedes]))();
     const vec = await this.embedder.embed(`${rec.subject}\n${rec.content}`, "document");
     const upsert = this.db.transaction(() => {
+      // The embedding await yields: another client may have forgotten or
+      // superseded this record meanwhile. Writing then would recreate derived
+      // rows for a record that is no longer current, so check inside the txn.
+      if (!this.db.prepare(`SELECT 1 FROM current_records WHERE id = ?`).get(rec.id)) return;
       this.db.prepare(`DELETE FROM vec_records WHERE record_id = ?`).run(rec.id);
       this.db.prepare(`INSERT INTO vec_records (record_id, embedding) VALUES (?, ?)`)
         .run(rec.id, new Uint8Array(vec.buffer, vec.byteOffset, vec.byteLength));
       this.store.setEmbeddingMeta(rec.id, this.embedder.model, this.embedder.dim, rec.content_hash);
-      // Prune the version this record supersedes from the derived search indexes,
-      // so only the current version stays searchable (no stale-row bloat or
-      // candidate-pool crowding from old versions).
-      if (rec.supersedes) this.store.deleteFromIndexes([rec.supersedes]);
     });
     upsert();
   }
@@ -270,9 +302,12 @@ export class SearchService {
     for (const r of recVec) reading(`record:${r.id}`).distance = r.distance;
 
     // Collapse chunk rows to one entry per page (first = best-ranked), keying by
-    // `page:<slug>` and remembering which chunk represented the page.
+    // `page:<slug>` and remembering which chunk represented the page. The
+    // keyword leg's chunk wins `bestChunk`; the vector leg's own pick is kept
+    // apart so a hit can name its section when the two legs disagree.
     const bestChunk = new Map<string, string>();
-    const collapse = (rows: { chunk_id: string; slug: string }[]): { id: string }[] => {
+    const vecChunk = new Map<string, string>();
+    const collapse = (rows: { chunk_id: string; slug: string }[], legChunk?: Map<string, string>): { id: string }[] => {
       const seen = new Set<string>();
       const out: { id: string }[] = [];
       for (const r of rows) {
@@ -280,12 +315,13 @@ export class SearchService {
         if (seen.has(id)) continue;
         seen.add(id);
         if (!bestChunk.has(id)) bestChunk.set(id, r.chunk_id);
+        legChunk?.set(id, r.chunk_id);
         out.push({ id });
       }
       return out;
     };
     const pageFts = collapse(pageFtsChunks);
-    const pageVec = collapse(pageVecChunks);
+    const pageVec = collapse(pageVecChunks, vecChunk);
 
     const legs: { rows: { id: string }[]; leg: Leg; weight?: number }[] = [
       { rows: recFts.map((r) => ({ id: `record:${r.id}` })), leg: "fts" },
@@ -301,7 +337,7 @@ export class SearchService {
     const kinds = this.pagesStore.kindsOf([...new Set([...pageFts, ...pageVec].map((r) => r.id.slice("page:".length)))]);
     const base = this.applyKindWeight(fuse(legs), kinds);
     const intent = opts.intent;
-    if (intent && (GRAPH_INTENTS.has(intent) || RECENCY_INTENTS.has(intent))) {
+    if (intent && (this.graphIntents.has(intent) || RECENCY_INTENTS.has(intent))) {
       const ranked = (scores: Map<string, FuseEntry>) => [...scores.entries()]
         .sort((a, b) => b[1].score - a[1].score)
         .map(([key]) => key)
@@ -309,7 +345,7 @@ export class SearchService {
         .map((key) => key.slice("page:".length));
       const rankedSlugs = ranked(base);
 
-      if (GRAPH_INTENTS.has(intent)) {
+      if (this.graphIntents.has(intent)) {
         // Seeds come from the EXACT keyword table fused with the vector leg, not
         // from the stemmed ranking (migration 014). Stemming makes "boxes" match
         // every "box", which on the live index moved the anchors and dropped the
@@ -348,9 +384,15 @@ export class SearchService {
         const chunkId = bestChunk.get(key) ?? (s.graph ? `${slug}#0` : undefined);
         const chunk = chunkId ? this.pagesStore.getChunk(chunkId) : null;
         const rd = readings.get(key) ?? {};
+        const vecId = vecChunk.get(key);
+        const vecHeading = vecId && vecId !== chunkId ? this.pagesStore.getChunk(vecId)?.heading : null;
+        const want = chunk?.heading?.toLowerCase();
+        const section = want ? splitSections(page.body).find((x) => x.heading.toLowerCase() === want)?.heading : undefined;
         hits.push({
           kind: "page", slug, title: page.title, chunk, score: s.score, fts: s.fts, vector: s.vector, graph: s.graph,
           page_kind: kinds.get(slug) ?? "authored", bm25: rd.bm25, distance: rd.distance, authored_at: page.authored_at ?? null,
+          ...(vecHeading && vecHeading !== chunk?.heading ? { vector_heading: vecHeading } : {}),
+          ...(section ? { section } : {}),
         });
       }
     }
@@ -396,14 +438,31 @@ export class SearchService {
   // from the canonical current records. Safe to run anytime; heals partial-index
   // states (e.g. an add that succeeded but whose embedding failed) and re-embeds
   // after an embedder/model change.
-  async reindexAll(): Promise<{ records: number }> {
-    const current = this.store.listCurrent(); // reads canonical `records`, not the indexes
-    this.store.clearDerivedIndexes();
+  //
+  // The text side (FTS + relationships) rebuilds in one synchronous transaction
+  // that does not depend on the embedder, so keyword search survives an outage.
+  // Vectors are replaced per record only after that record embeds; a failure
+  // keeps the prior vector (a current id's content never changes in place, so it
+  // is still right unless the model changed, which doctor's staleModel reports)
+  // and is returned in `failed` rather than abandoning the rest.
+  async reindexAll(): Promise<{ records: number; failed: string[] }> {
+    const current = this.db.transaction(() => {
+      const recs = this.store.listCurrent(); // reads canonical `records`, not the indexes
+      this.store.clearTextIndexes();
+      this.store.pruneNonCurrentVectors();
+      for (const rec of recs) this.store.reindexText(rec);
+      return recs;
+    })();
+    const failed: string[] = [];
     for (const rec of current) {
-      this.store.reindexText(rec);
-      await this.index(rec);
+      try {
+        await this.index(rec);
+      } catch (e) {
+        console.error(`[reindex] embedding failed for ${rec.id} (${(e as Error).message}); kept prior vector`);
+        failed.push(rec.id);
+      }
     }
-    return { records: current.length };
+    return { records: current.length, failed };
   }
 
   // Report derived-index health against the canonical current records without

@@ -390,3 +390,12 @@ test("putPage (real git) a refused commit leaves the tracked file and index clea
   expect(existsSync(join(root, "wiki/concepts/new.md"))).toBe(false);
   expect(g(["status", "--porcelain"])).toBe("");
 });
+
+test("putPage changing a page's frontmatter slug leaves only the new slug live", async () => {
+  const { git } = fakeGit();
+  const path = "wiki/concepts/a.md";
+  expect((await putPage(cfg(), svc, store, { path, content: "---\ntitle: A\nslug: old\n---\nbody\n" }, git)).ok).toBe(true);
+  const r = await putPage(cfg(), svc, store, { path, content: "---\ntitle: A\nslug: new\n---\nbody\n" }, git);
+  expect(r.ok).toBe(true);
+  expect(store.listPages().filter((p) => p.source_path === path).map((p) => p.slug)).toEqual(["new"]);
+});

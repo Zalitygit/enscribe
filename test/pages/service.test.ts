@@ -1,9 +1,12 @@
 import { beforeEach, expect, test } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { openDb, type Database } from "../../src/core/db.js";
 import { PagesStore } from "../../src/pages/store.js";
 import { PageService } from "../../src/pages/service.js";
 import { FakeEmbedder } from "../../src/embed/fake.js";
-import { CHUNK_SCHEME } from "../../src/pages/parse.js";
+import { CHUNK_SCHEME, chunkBody } from "../../src/pages/parse.js";
 
 let db: Database;
 let store: PagesStore;
@@ -169,6 +172,11 @@ class CountingEmbedder extends FakeEmbedder {
   }
 }
 
+// The same embedder reporting another model name, as a backend change would.
+function renamed(model: string): CountingEmbedder {
+  return Object.defineProperty(new CountingEmbedder(), "model", { value: model });
+}
+
 test("frontmatter churn outside the aliases updates the page without re-embedding", async () => {
   const emb = new CountingEmbedder();
   const s = new PageService(db, store, emb);
@@ -237,6 +245,64 @@ test("chunks record the embedding model and chunk scheme that produced them", as
   ]);
 });
 
+// Unchanged content is only a no-op when the derived chunk rows are still the
+// ones this service would write. Otherwise vault sync, the documented recovery
+// route, could never heal a model change, a scheme bump or a lost index.
+const NOTE = `---\ntitle: Note\n---\n# Note\n\nBody text.\n`;
+const chunkCount = (table: string) =>
+  (db.prepare(`SELECT count(*) AS c FROM ${table} WHERE chunk_id LIKE 'note#%'`).get() as { c: number }).c;
+
+test("an unchanged re-ingest under a different embedding model re-embeds", async () => {
+  await svc.ingest("note.md", NOTE);
+  const emb = renamed("replacement-model");
+  const { changed } = await new PageService(db, store, emb).ingest("note.md", NOTE);
+  expect(changed).toBe(true);
+  expect(emb.calls).toBeGreaterThan(0);
+  expect(store.chunkProvenance().map((r) => r.embedding_model)).toEqual(["replacement-model"]);
+});
+
+test("an unchanged re-ingest after a chunk-scheme change re-embeds", async () => {
+  await svc.ingest("note.md", NOTE);
+  db.prepare(`UPDATE page_chunks SET chunk_scheme = 'older-scheme'`).run();
+  const emb = new CountingEmbedder();
+  expect((await new PageService(db, store, emb).ingest("note.md", NOTE)).changed).toBe(true);
+  expect(emb.calls).toBeGreaterThan(0);
+  expect(store.chunkProvenance().map((r) => r.chunk_scheme)).toEqual([CHUNK_SCHEME]);
+});
+
+for (const table of ["page_chunks", "page_chunks_fts", "page_chunks_fts_exact", "vec_page_chunks"]) {
+  test(`an unchanged re-ingest rebuilds a page whose ${table} rows are missing`, async () => {
+    await svc.ingest("note.md", NOTE);
+    const expected = chunkCount("page_chunks");
+    db.prepare(`DELETE FROM ${table} WHERE chunk_id LIKE 'note#%'`).run();
+    expect((await svc.ingest("note.md", NOTE)).changed).toBe(true);
+    for (const t of ["page_chunks", "page_chunks_fts", "page_chunks_fts_exact", "vec_page_chunks"]) {
+      expect(chunkCount(t)).toBe(expected);
+    }
+  });
+}
+
+test("a frontmatter-only edit re-embeds when the reused chunks are stale", async () => {
+  await svc.ingest("note.md", NOTE);
+  const emb = renamed("replacement-model");
+  await new PageService(db, store, emb).ingest("note.md", `---\ntitle: Note\nupdated: 2026-10-31\n---\n# Note\n\nBody text.\n`);
+  expect(emb.calls).toBeGreaterThan(0);
+  expect(store.chunkProvenance().map((r) => r.embedding_model)).toEqual(["replacement-model"]);
+});
+
+test("putGenerated rebuilds unchanged content whose chunks are stale", async () => {
+  await svc.putGenerated({ slug: "note", title: "Note", body: "Generated body." }, "gen");
+  const emb = renamed("replacement-model");
+  const res = await new PageService(db, store, emb).putGenerated({ slug: "note", title: "Note", body: "Generated body." }, "gen");
+  expect(res.changed).toBe(true);
+  expect(store.chunkProvenance().map((r) => r.embedding_model)).toEqual(["replacement-model"]);
+});
+
+test("a page whose body yields no chunks is still a no-op on re-ingest", async () => {
+  await svc.ingest("empty.md", `---\ntitle: Empty\n---\n`);
+  expect((await svc.ingest("empty.md", `---\ntitle: Empty\n---\n`)).changed).toBe(false);
+});
+
 test("ingest lifts frontmatter type into the pages.type column", async () => {
   await svc.ingest("typed.md", `---\ntype: concept\ntitle: Typed\n---\n# Typed\n\nBody.\n`);
   expect(store.getPage("typed")?.type).toBe("concept");
@@ -297,4 +363,178 @@ test("resolveAll picks up an mdlink to a page ingested later", async () => {
   expect(store.getBacklinks("later")).toEqual([]);
   await svc.resolveAll();
   expect(store.getBacklinks("later").map((r) => r.from_slug)).toEqual(["index"]);
+});
+
+// A file's slug can change in place (frontmatter `slug:` edited). The file is
+// one page, so the former slug must be retired, not left live beside the new one.
+const live = () => store.listPages().map((p) => p.slug).sort();
+
+test("re-ingesting a file under a new slug retires the former slug", async () => {
+  await svc.ingest("wiki/a.md", `---\ntitle: Alpha\nslug: old\n---\nalpha body\n`);
+  await svc.ingest("wiki/a.md", `---\ntitle: Alpha\nslug: new\n---\nalpha body\n`);
+  expect(live()).toEqual(["new"]);
+  expect(store.getPage("old")?.deleted_at).not.toBeNull();
+  expect((db.prepare(`SELECT count(*) AS c FROM page_chunks WHERE slug='old'`).get() as { c: number }).c).toBe(0);
+  expect(store.resolve("Alpha")).toBe("new");
+});
+
+test("deleting the file after a slug change leaves no live page for it", async () => {
+  await svc.ingest("wiki/a.md", `---\ntitle: Alpha\nslug: old\n---\nalpha body\n`);
+  await svc.ingest("wiki/a.md", `---\ntitle: Alpha\nslug: new\n---\nalpha body\n`);
+  const page = store.getBySourcePath("wiki/a.md"); // what the watcher does on unlink
+  store.softDelete(page!.slug);
+  expect(live()).toEqual([]);
+});
+
+test("inbound links follow a slug change: by title they re-resolve, by old slug they go unresolved", async () => {
+  await svc.ingest("wiki/a.md", `---\ntitle: Alpha\nslug: old\n---\nalpha body\n`);
+  await svc.ingest("wiki/b.md", `---\ntitle: Bee\n---\nSee [[Alpha]] and [[old]].\n`);
+  await svc.ingest("wiki/a.md", `---\ntitle: Alpha\nslug: new\n---\nalpha body\n`);
+  const to = (db.prepare(`SELECT to_slug FROM page_links WHERE from_slug='b'`).all() as { to_slug: string }[]).map((r) => r.to_slug);
+  expect(to).toEqual(["new"]);
+  const unresolved = (db.prepare(`SELECT raw_text FROM unresolved_links WHERE from_slug='b'`).all() as { raw_text: string }[]).map((r) => r.raw_text);
+  expect(unresolved).toEqual(["old"]);
+});
+
+// writePage embeds before its transaction, so an older ingest of a file can
+// commit after a newer one. The newer ingest of a source path must win however
+// the embeddings finish, including across processes (two connections, one DB).
+function holdable() {
+  const inner = new FakeEmbedder();
+  const emb = new FakeEmbedder();
+  let gate: Promise<void> | null = null;
+  emb.embed = async (t, k) => { const g = gate; gate = null; if (g) await g; return inner.embed(t, k); };
+  // Holds the NEXT embed call (the first chunk of the next ingest that embeds).
+  const holdNext = () => { let release!: () => void; gate = new Promise<void>((r) => { release = r; }); return release; };
+  return { emb, holdNext };
+}
+
+test("a delayed older ingest cannot retire the newer slug (reversed completion)", async () => {
+  const { emb, holdNext } = holdable();
+  svc = new PageService(db, store, emb);
+  await svc.ingest("wiki/a.md", `---\ntitle: Alpha\nslug: old\n---\nfirst\n`);
+  const release = holdNext();
+  const older = svc.ingest("wiki/a.md", `---\ntitle: Alpha\nslug: old\n---\nsecond\n`);
+  await svc.ingest("wiki/b.md", `---\ntitle: Bee\n---\nSee [[Alpha]].\n`);
+  await svc.ingest("wiki/a.md", `---\ntitle: Alpha\nslug: new\n---\nthird\n`);
+  release();
+  await older;
+  expect(live()).toEqual(["b", "new"]);
+  expect(store.getPage("new")?.body).toContain("third");
+  expect((db.prepare(`SELECT count(*) AS c FROM page_chunks WHERE slug='new'`).get() as { c: number }).c).toBeGreaterThan(0);
+  expect((db.prepare(`SELECT count(*) AS c FROM page_chunks WHERE slug='old'`).get() as { c: number }).c).toBe(0);
+  const to = (db.prepare(`SELECT to_slug FROM page_links WHERE from_slug='b'`).all() as { to_slug: string }[]).map((r) => r.to_slug);
+  expect(to).toEqual(["new"]);
+});
+
+test("two edits of one file with reversed embedding completion keep the later body", async () => {
+  const { emb, holdNext } = holdable();
+  svc = new PageService(db, store, emb);
+  const release = holdNext();
+  const older = svc.ingest("wiki/a.md", `---\ntitle: Alpha\n---\nolder\n`);
+  await svc.ingest("wiki/a.md", `---\ntitle: Alpha\n---\nnewer\n`);
+  release();
+  await older;
+  expect(store.getPage("a")?.body).toContain("newer");
+});
+
+test("a newer ingest that finds the content unchanged still cancels an older in-flight one", async () => {
+  const { emb, holdNext } = holdable();
+  svc = new PageService(db, store, emb);
+  await svc.ingest("wiki/a.md", `---\ntitle: Alpha\n---\nv1\n`);
+  const release = holdNext();
+  const older = svc.ingest("wiki/a.md", `---\ntitle: Alpha\n---\nv2\n`);
+  expect(await svc.ingest("wiki/a.md", `---\ntitle: Alpha\n---\nv1\n`)).toEqual({ slug: "a", changed: false }); // reverted
+  release();
+  await older;
+  expect(store.getPage("a")?.body).toContain("v1");
+});
+
+// Authored-wins must hold at commit time, not only when putGenerated starts:
+// an authored ingest can land while the generator is embedding.
+test("a generator that was embedding when an authored page landed yields to it", async () => {
+  const { emb, holdNext } = holdable();
+  const gen = new PageService(db, store, emb);
+  const release = holdNext();
+  const pending = gen.putGenerated({ slug: "race", title: "Race", body: "Generated report" }, "gen");
+  await svc.ingest("wiki/race.md", "# Race\nAuthored canonical note\n");
+  release();
+  expect(await pending).toEqual({ slug: "race", changed: false, skipped: "wiki/race.md" });
+  const page = store.getPage("race");
+  expect(page?.source_path).toBe("wiki/race.md");
+  expect(page?.generator).toBeNull();
+  expect(page?.body).toContain("Authored canonical note");
+  expect((db.prepare(`SELECT text FROM page_chunks WHERE slug='race'`).all() as { text: string }[])
+    .every((r) => r.text.includes("Authored"))).toBe(true);
+});
+
+test("retire() removes the live page and cancels an in-flight ingest of that path", async () => {
+  const { emb, holdNext } = holdable();
+  svc = new PageService(db, store, emb);
+  const release = holdNext();
+  const pending = svc.ingest("wiki/a.md", `---\ntitle: Alpha\n---\nbody\n`);
+  svc.retire("wiki/a.md");
+  release();
+  await pending;
+  expect(live()).toEqual([]);
+});
+
+test("the newer ingest wins across two connections to one database file", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "mb-ingest-"));
+  try {
+    const path = join(dir, "x.db");
+    const db1 = openDb(path), db2 = openDb(path);
+    const s1 = new PagesStore(db1), s2 = new PagesStore(db2);
+    const { emb, holdNext } = holdable();
+    const p1 = new PageService(db1, s1, emb), p2 = new PageService(db2, s2, new FakeEmbedder());
+    const release = holdNext();
+    const older = p1.ingest("wiki/a.md", `---\ntitle: Alpha\nslug: old\n---\nolder\n`);
+    await p2.ingest("wiki/a.md", `---\ntitle: Alpha\nslug: new\n---\nnewer\n`);
+    release();
+    await older;
+    expect(s1.listPages().map((p) => p.slug)).toEqual(["new"]);
+    db1.close(); db2.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Another process can commit between this process's last read and its write
+// transaction (while BEGIN IMMEDIATE waits for the lock), or right after it.
+// Runs `before`/`after` around the next transaction's body to stand in for it.
+function aroundNextTransaction(d: Database, hooks: { before?: () => void; after?: () => void }) {
+  const orig = d.transaction.bind(d);
+  (d as any).transaction = (body: (...a: unknown[]) => unknown) => {
+    (d as any).transaction = orig;
+    const tx = orig(body);
+    const run = (...a: unknown[]) => tx(...a);
+    run.immediate = (...a: unknown[]) => {
+      hooks.before?.();
+      try { return tx.immediate(...a); } finally { hooks.after?.(); }
+    };
+    return run;
+  };
+}
+
+test("a yielding generator reports the authored owner it saw at commit, even if it is purged just after", async () => {
+  const { emb, holdNext } = holdable();
+  const gen = new PageService(db, store, emb);
+  const release = holdNext();
+  const pending = gen.putGenerated({ slug: "race", title: "Race", body: "Generated report" }, "gen");
+  await svc.ingest("wiki/race.md", "# Race\nAuthored canonical note\n");
+  aroundNextTransaction(db, { after: () => { svc.retire("wiki/race.md"); store.purgeTombstoned(); } });
+  release();
+  expect(await pending).toEqual({ slug: "race", changed: false, skipped: "wiki/race.md" });
+});
+
+test("chunks lost after the reuse decision are rebuilt, not reused", async () => {
+  const body = "# Report\n\nGenerated body.\n";
+  await svc.putGenerated({ slug: "rep", title: "Report", body, type: "a" }, "gen");
+  // Same title and body, so the chunks would be reused; another writer drops
+  // the keyword rows before this write's transaction runs.
+  aroundNextTransaction(db, { before: () => {
+    db.prepare(`DELETE FROM page_chunks_fts WHERE chunk_id LIKE 'rep#%'`).run();
+  } });
+  expect((await svc.putGenerated({ slug: "rep", title: "Report", body, type: "b" }, "gen")).changed).toBe(true);
+  expect(store.chunksIntact("rep", chunkBody(body).length, { model: new FakeEmbedder().model, scheme: CHUNK_SCHEME })).toBe(true);
 });

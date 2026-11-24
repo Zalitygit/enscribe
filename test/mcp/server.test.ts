@@ -124,3 +124,51 @@ test("update_memory supersedes and forget_record removes from current", async ()
   const recent = textOf(await client.callTool({ name: "list_recent", arguments: {} }));
   expect(recent.records.some((r: any) => r.id === v2.id)).toBe(false);
 });
+
+// The canonical write commits before the vector is embedded. When embedding
+// fails, the tool must report the committed record with an indexError, not an
+// error: a caller told "failed" retries, and every retry stores another copy.
+async function clientWithBrokenEmbedder() {
+  const db = openDb(":memory:");
+  const store = new Store(db);
+  const broken = new FakeEmbedder();
+  broken.embed = async () => { throw new Error("embedding unavailable"); };
+  const search = new SearchService(db, store, broken);
+  const server = buildServer({ store, search });
+  const [a, b] = InMemoryTransport.createLinkedPair();
+  const c = new Client({ name: "test", version: "0" });
+  await Promise.all([server.connect(a), c.connect(b)]);
+  return { client: c, store };
+}
+
+test("add_memory reports a committed record with indexError when embedding fails", async () => {
+  const { client: c, store } = await clientWithBrokenEmbedder();
+  const result: any = await c.callTool({ name: "add_memory", arguments: { type: "note", subject: "S", content: "body" } });
+  expect(result.isError).toBeFalsy();
+  const added = textOf(result);
+  expect(added.id).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
+  expect(added.indexError).toContain("embedding unavailable");
+  expect(store.listCurrent({}).map((r) => r.id)).toEqual([added.id]);
+});
+
+test("update_memory reports the new version with indexError when embedding fails", async () => {
+  const { client: c, store } = await clientWithBrokenEmbedder();
+  const added = textOf(await c.callTool({ name: "add_memory", arguments: { type: "note", subject: "S", content: "v1" } }));
+  const result: any = await c.callTool({ name: "update_memory", arguments: { id: added.id, patch: { content: "v2" } } });
+  expect(result.isError).toBeFalsy();
+  const updated = textOf(result);
+  expect(updated.supersedes).toBe(added.id);
+  expect(updated.indexError).toContain("embedding unavailable");
+  expect(store.listCurrent({}).map((r) => r.id)).toEqual([updated.id]);
+});
+
+test("link_records reports ok with indexError when embedding fails", async () => {
+  const { client: c } = await clientWithBrokenEmbedder();
+  const a = textOf(await c.callTool({ name: "add_memory", arguments: { type: "note", subject: "A", content: "a" } }));
+  const result: any = await c.callTool({ name: "link_records", arguments: { subject: a.id, predicate: "relates_to", object: "x" } });
+  expect(result.isError).toBeFalsy();
+  const linked = textOf(result);
+  expect(linked.ok).toBe(true);
+  expect(linked.id).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
+  expect(linked.indexError).toContain("embedding unavailable");
+});

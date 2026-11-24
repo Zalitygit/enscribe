@@ -84,9 +84,9 @@ answers `{hits, confident, reason?}`:
   floor. A search that found nothing relevant says so instead of ranking noise.
 - **Page hits carry `page_kind`** (`authored` | `raw` | `generated`), **`bm25`**
   and **`distance`**, so a caller can judge a hit rather than trust a fused rank.
-- **`intent` is declared by the caller, never inferred.** Send `entity` when the
-  question is about one named thing; it adds pages one hop away in the wikilink
-  graph. Other values are accepted but change nothing. Omitting it is safe.
+- **`intent` is declared by the caller, never inferred.** Every value is
+  accepted so a question can be labelled honestly; none changes retrieval
+  today, because each special plan measured worse. Omitting it is safe.
 
 The MCP `doctor` tool reports page-index health; the CLI `doctor` command
 reports record-index health.
@@ -108,6 +108,15 @@ Clients send `Authorization: Bearer <token>` to `http(s)://host:PORT/mcp`
 (Streamable HTTP). For connector UIs with no header field, `?token=<token>` also
 works; the header wins, and query tokens show up in proxy access logs. Put it
 behind a TLS reverse proxy for remote use.
+
+**Page viewer.** The same server serves a read-only browser view at `/view`: a
+hyperbolic (Poincaré-disk) map of the wiki link graph. Click a page to bring
+it to the centre and open it beside the map (body, trust fields, links,
+backlinks); drag to move around; search by title or slug. The HTML and script
+are public and carry no data. The page asks once for a token with
+`pages.read`, keeps it in the browser's local storage, and sends it as a
+bearer header to `/view/api/*` (the query-string form is refused there).
+Finding badges appear only for a token that also holds `findings.read`.
 
 Scopes: `memory.read`, `memory.search`, `memory.append`, `memory.modify`,
 `memory.delete`, `memory.private` (declared, gates nothing), `pages.read`,
@@ -157,7 +166,7 @@ One table of maintenance items with states `open`, `acknowledged`, `wont_fix`,
 stays quiet. Three sources write to it under disjoint kinds:
 
 - the built-in nightly detectors (`orphan`, `unresolved`, `unknown-link-type`,
-  `secret`);
+  `secret`, `stale`);
 - an external judgment client through `report_findings` (`red-link`,
   `contradiction`);
 - agents filing one item at a time through `add_finding` (`needs-human` for
@@ -172,7 +181,8 @@ node dist/cli/index.js doctor    # record-index health
 node dist/cli/index.js reindex   # rebuild every record index
 ```
 
-The page index is rebuilt by `vault sync`. Three tables are **not** rebuildable
+The page index is rebuilt by `vault sync`, which also re-embeds any page whose
+chunks are missing or came from another embedding model. Three tables are **not** rebuildable
 and only `backup` protects them: `findings` (human verdicts), the snapshot tables
 behind the change digest, and `meta`.
 
@@ -197,8 +207,6 @@ behind the change digest, and `meta`.
 - **macOS: the CLI exits 134 after finishing its work** when the ONNX embedder
   was loaded (onnxruntime teardown). The work is committed first. Linux and
   `serve` are unaffected; it matters under `set -e`.
-- **`test/pages/vault-watch.test.ts` is a timing flake** under full-suite load.
-  Re-run that file alone before believing a failure there.
 
 ## Project layout
 

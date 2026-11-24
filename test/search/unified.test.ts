@@ -75,10 +75,25 @@ test("omitting intent is identical to intent=factual", async () => {
   expect(bare.every((h) => h.graph !== true)).toBe(true);
 });
 
+// The entity leg was unwired 2026-11-02 (docs/evidence/2026-11-02-query-weighted-graph.md):
+// it only re-ranked pages the text legs had already found, and which page won
+// flipped on seed membership. So `entity` now retrieves exactly as omitting it.
+test("intent=entity is identical to omitting intent", async () => {
+  await hubAndSpoke();
+  const slugs = (hs: UnifiedHit[]) => hs.map((h) => (h.kind === "page" ? h.slug : h.record.id));
+  const entity = await search.searchUnified("query token vvqx", { intent: "entity" });
+  expect(slugs(entity)).toEqual(slugs(await search.searchUnified("query token vvqx")));
+  expect(entity.every((h) => h.graph !== true)).toBe(true);
+});
+
+// The tests below drive the graph leg through `graphIntents`, the constructor
+// override that keeps it covered while no intent is wired to it.
 // Three pages carry the query token so they occupy the anchor slots, leaving
 // `spoke` reachable ONLY by following hub's wikilink. Fewer text matches than
 // GRAPH_SEEDS would make spoke an anchor itself, and anchors are excluded from
 // their own expansion — the leg adds candidates, it does not re-boost seeds.
+const graphSearch = () => new SearchService(db, store, new FakeEmbedder(), pages, { graphIntents: ["entity"] });
+
 async function hubAndSpoke(spokeBody = "totally unrelated prose"): Promise<void> {
   await pageSvc.ingest("hub.md", `---\ntitle: Hub\n---\n# Hub\n\nquery token vvqx. See [[spoke]].\n`);
   await pageSvc.ingest("alt-one.md", `---\ntitle: Alt One\n---\n# Alt One\n\nquery token vvqx again\n`);
@@ -87,9 +102,9 @@ async function hubAndSpoke(spokeBody = "totally unrelated prose"): Promise<void>
   await pageSvc.resolveAll();
 }
 
-test("intent=entity reaches a linked page and marks it as graph-reached", async () => {
+test("the graph leg reaches a linked page and marks it as graph-reached", async () => {
   await hubAndSpoke();
-  const hits = await search.searchUnified("query token vvqx", { intent: "entity" });
+  const hits = await graphSearch().searchUnified("query token vvqx", { intent: "entity" });
   const spoke = hits.find((h) => h.kind === "page" && h.slug === "spoke");
   expect(spoke).toBeDefined();
   expect(spoke?.graph).toBe(true);
@@ -99,7 +114,7 @@ test("intent=entity reaches a linked page and marks it as graph-reached", async 
 
 test("a graph-reached page still carries readable chunk content", async () => {
   await hubAndSpoke("distinctive spoke prose");
-  const hits = await search.searchUnified("query token vvqx", { intent: "entity" });
+  const hits = await graphSearch().searchUnified("query token vvqx", { intent: "entity" });
   const spoke = hits.find((h) => h.kind === "page" && h.slug === "spoke");
   expect(spoke?.kind === "page" && spoke.chunk?.text).toContain("distinctive spoke prose");
 });
@@ -118,7 +133,7 @@ test("the keyword leg matches a different form of the query word", async () => {
 // entity seeds are picked from the EXACT keyword copy, fused with the vector leg:
 // here only the exact-match page links to the spoke, and four pages that match
 // only by stem would otherwise take all three seed slots.
-test("intent=entity picks its seeds from exact keyword matches, not stemmed ones", async () => {
+test("the graph leg picks its seeds from exact keyword matches, not stemmed ones", async () => {
   // FakeEmbedder's hash vectors rank pages arbitrarily and could make the spoke
   // a seed (seeds are excluded from their own expansion). This one puts the
   // spoke far from every query and ties the rest, so only the keyword legs
@@ -128,7 +143,7 @@ test("intent=entity picks its seeds from exact keyword matches, not stemmed ones
     async embed(text) { const v = new Float32Array(768); v[0] = 1; if (text.includes("unrelated")) v[1] = 10; return v; },
   };
   const svc = new PageService(db, pages, far);
-  const s = new SearchService(db, store, far, pages);
+  const s = new SearchService(db, store, far, pages, { graphIntents: ["entity"] });
   await svc.ingest("exact.md", `---\ntitle: Exact\n---\n# Exact\n\nboxes. See [[spoke]].\n`);
   for (const n of [1, 2, 3, 4]) {
     await svc.ingest(`stem-${n}.md`, `---\ntitle: Stem ${n}\n---\n# Stem ${n}\n\nbox box box box box\n`);
@@ -300,4 +315,56 @@ test("a page hit with no authored stamp carries authored_at null", async () => {
   const page = hits.find((h) => h.kind === "page" && h.slug === "unstamped") as Extract<UnifiedHit, { kind: "page" }>;
   expect(page).toBeDefined();
   expect(page.authored_at).toBeNull();
+});
+
+// The excerpt is the chunk the keyword leg ranked first, so a page the vector
+// leg reached through a different section shows only the keyword section. The
+// hit names the vector leg's section too, so the caller can fetch it directly
+// (get_page with `section`) instead of reading the whole page to find it.
+test("a page hit names the vector leg's section when it differs from the excerpt", async () => {
+  const split: Embedder = {
+    model: "split-embed", dim: 768,
+    async embed(text, kind) {
+      const v = new Float32Array(768); v[0] = 1;
+      if (kind === "query" ? text.includes("kwtoken") : text.includes("twin")) v[1] = 10;
+      return v;
+    },
+  };
+  const svc = new PageService(db, pages, split);
+  const s = new SearchService(db, store, split, pages);
+  await svc.ingest("db.md", `---\ntitle: Db\n---\n## Intro\n\nkwtoken named here\n\n## Storage\n\nsemantic twin prose\n`);
+  const hit = (await s.searchUnified("kwtoken")).find((h) => h.kind === "page" && h.slug === "db");
+  expect(hit?.kind === "page" && hit.chunk?.heading).toBe("Intro");
+  expect(hit?.kind === "page" && hit.vector_heading).toBe("Storage");
+});
+
+test("a page hit carries no vector_heading when both legs chose the same section", async () => {
+  await pageSvc.ingest("one.md", `---\ntitle: One\n---\n## Only\n\nunique lexical token qwzzx\n`);
+  const hit = (await search.searchUnified("unique lexical token qwzzx")).find((h) => h.kind === "page");
+  expect(hit?.kind === "page" && "vector_heading" in hit).toBe(false);
+});
+
+// `section` is the hit's handle for get_page's `section` argument, so the
+// caller can fetch the matching section instead of the whole page. It is
+// present only when get_page would accept it: a heading-less preamble chunk
+// has none, and a `#` line inside a code fence is a chunk heading to
+// chunkBody (not fence-aware) but not a section to splitSections.
+test("a page hit carries the excerpt's section, ready for get_page", async () => {
+  await pageSvc.ingest("sec.md", `---\ntitle: Sec\n---\n# Sec\n\nintro\n\n## Storage layer\n\nunique lexical token ppqzx\n`);
+  const hit = (await search.searchUnified("unique lexical token ppqzx")).find((h) => h.kind === "page" && h.slug === "sec");
+  expect(hit?.kind === "page" && hit.section).toBe("Storage layer");
+});
+
+test("a page hit whose excerpt sits before any heading carries no section", async () => {
+  await pageSvc.ingest("pre.md", `---\ntitle: Pre\n---\nunique lexical token mmkkw before headings\n\n## Later\n\nother\n`);
+  const hit = (await search.searchUnified("unique lexical token mmkkw")).find((h) => h.kind === "page" && h.slug === "pre");
+  expect(hit).toBeDefined();
+  expect(hit?.kind === "page" && "section" in hit).toBe(false);
+});
+
+test("a heading inside a code fence is not offered as a section", async () => {
+  await pageSvc.ingest("fence.md", `---\ntitle: Fence\n---\n## Real\n\ntext\n\n\`\`\`sh\n# not a heading\nunique lexical token ffzzq\n\`\`\`\n`);
+  const hit = (await search.searchUnified("unique lexical token ffzzq")).find((h) => h.kind === "page" && h.slug === "fence");
+  expect(hit?.kind === "page" && hit.chunk?.heading).toBe("not a heading");
+  expect(hit?.kind === "page" && "section" in hit).toBe(false);
 });

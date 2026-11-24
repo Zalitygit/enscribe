@@ -64,8 +64,12 @@ jobs:
 
       # better-sqlite3 and sqlite-vec are native; `npm ci` builds them against
       # the matrix Node rather than reusing a binary built for another ABI.
+      # onnxruntime-node's install script also fetches CUDA binaries on Linux;
+      # that download 404s upstream (2026-11-24) and nothing here uses CUDA.
       - name: Install
         run: npm ci
+        env:
+          npm_config_onnxruntime_node_install_cuda: skip
 
       # The ONNX embedder downloads ~100MB on its first ever call, which two
       # integration tests exercise. Cached across runs so a green suite does not
@@ -83,17 +87,7 @@ jobs:
       - name: Build
         run: npm run build
 
-      # Known flake: test/pages/vault-watch.test.ts loses a chokidar timing race
-      # under full-suite parallel load, roughly two runs in three, and passes in
-      # isolation every time. It is NOT excluded here, deliberately - hiding it
-      # would make CI green while the condition that makes every red result a
-      # judgement call is still present. A retry is the honest compromise: it
-      # keeps the signal and stops the flake from blocking the branch.
+      # No retry: the vault-watch timing flake was fixed 2026-10-31, so a red
+      # result here is a real failure.
       - name: Test
-        run: npm test
-        id: test
-        continue-on-error: true
-
-      - name: Test (retry once, for the known watcher flake)
-        if: steps.test.outcome == 'failure'
         run: npm test

@@ -1,8 +1,10 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { Store } from "../core/store.js";
+import type { MemoryRecord } from "../core/types.js";
 import { SEARCH_INTENTS, assessConfidence, type SearchService } from "../search/index.js";
 import { SCOPES } from "./scopes.js";
+import { serverInstructions, USAGE_GUIDE_ALIAS } from "./instructions.js";
 import { recordShape, recordInputSchema, typeEnum } from "../schema.js";
 import type { PagesStore } from "../pages/store.js";
 import type { PageService } from "../pages/service.js";
@@ -12,14 +14,19 @@ import { putPage } from "../pages/put-page.js";
 import { editPage } from "../pages/edit-page.js";
 import { splitSections, EDGE_TYPES } from "../pages/parse.js";
 import type { FindingsStore } from "../findings/ledger.js";
-import { APPENDABLE_KINDS, REPORTABLE_KINDS, findingKey, type Finding } from "../findings/types.js";
-import { normalizeDue, normalizeSubject } from "../findings/due.js";
+import { APPENDABLE_KINDS, REPORTABLE_KINDS, type Finding } from "../findings/types.js";
+import { normalizeDue } from "../findings/due.js";
+import { appendFinding } from "../findings/append.js";
+import type { ToolCallEvent } from "./call-log.js";
+import { pageHistoryOf } from "../pages/history.js";
+import { SENSITIVE } from "../pages/generators/activity-digest.js";
 
 // get_page cuts a body here unless told otherwise. The harness's tool-output
 // cap sits around 25K tokens; measured 2026-09-09, a 101 KB page failed every
 // read and a 64 KB findings list overflowed, so this is a body that fits with
 // room for the JSON envelope. An over-cap page gets an outline instead.
 export const PAGE_MAX_CHARS = 60_000;
+export const GET_PAGES_MAX = 10;
 
 // Nearest live slugs to a missed get_page request: share of the request's
 // tokens that appear in a page's slug or title, ties to the shorter slug, top
@@ -44,15 +51,43 @@ function json(data: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(data) }] };
 }
 
+// The record and its keyword row are already committed when the vector is
+// embedded, so an embedding failure is not a failed write. Report it beside
+// the result (as put_page reports ingestError): a caller told the write failed
+// retries it, and each retry stores another copy. `reindex` heals the vector.
+async function indexed(search: SearchService, rec: MemoryRecord): Promise<{ indexError?: string }> {
+  try {
+    await search.index(rec);
+    return {};
+  } catch (e) {
+    return { indexError: String(e) };
+  }
+}
+
+
 // `allowedScopes` gates each tool by its declared scope. Omit it (or pass
 // undefined) for full-trust local use (stdio); pass an authenticated client's
 // scopes for the shared HTTP server so, e.g., a read-only token can't forget.
 export function buildServer(
-  deps: { store: Store; search: SearchService; pages?: PagesStore; service?: PageService; vaultConfig?: VaultConfig; findings?: FindingsStore; contextPath?: string },
+  deps: {
+    store: Store; search: SearchService; pages?: PagesStore; service?: PageService; vaultConfig?: VaultConfig; findings?: FindingsStore; contextPath?: string;
+    // Called after every tool call (src/mcp/call-log.ts). Only the HTTP server
+    // sets it: on stdio, stdout is the MCP channel itself.
+    onToolCall?: (e: ToolCallEvent) => void;
+  },
   allowedScopes?: Set<string>,
 ): McpServer {
   const { store, search, pages, service, vaultConfig, findings } = deps;
-  const server = new McpServer({ name: "enscribe", version: "0.0.0" });
+  const can = (tool: string) => !allowedScopes || allowedScopes.has(SCOPES[tool as keyof typeof SCOPES]);
+  const server = new McpServer({ name: "enscribe", version: "0.0.0" }, {
+    instructions: serverInstructions({
+      can,
+      hasPages: !!pages,
+      hasFindings: !!findings,
+      hasHistory: !!(pages && vaultConfig),
+      guideSlug: pages?.resolve(USAGE_GUIDE_ALIAS) ?? null,
+    }),
+  });
 
   const require = (scope: string) => {
     if (allowedScopes && !allowedScopes.has(scope)) {
@@ -65,19 +100,34 @@ export function buildServer(
   // calls inside each handler stay as defense in depth. A name missing from
   // SCOPES fails closed for scoped clients (hidden, never callable).
   const registerTool: McpServer["registerTool"] = (name, config, cb) => {
-    if (allowedScopes && !allowedScopes.has(SCOPES[name as keyof typeof SCOPES])) {
+    if (!can(name)) {
       return undefined as unknown as ReturnType<McpServer["registerTool"]>;
     }
-    return server.registerTool(name, config as never, cb as never);
+    const hook = deps.onToolCall;
+    if (!hook) return server.registerTool(name, config as never, cb as never);
+    // A failing hook must never fail the call it is reporting.
+    const report = (e: ToolCallEvent) => { try { hook(e); } catch { /* logging only */ } };
+    const logged = async (...a: unknown[]) => {
+      const args = (a.length > 1 && a[0] && typeof a[0] === "object" ? a[0] : {}) as Record<string, unknown>;
+      const start = Date.now();
+      try {
+        const result = await (cb as (...x: unknown[]) => unknown)(...a);
+        report({ tool: name, args, ms: Date.now() - start, result });
+        return result;
+      } catch (error) {
+        report({ tool: name, args, ms: Date.now() - start, error });
+        throw error;
+      }
+    };
+    return server.registerTool(name, config as never, logged as never);
   };
 
   registerTool("add_memory",
-    { description: `Create a canonical memory record (a durable fact, decision, or preference). For notes that belong in the git vault, use put_page instead. Scope: ${SCOPES.add_memory}`, inputSchema: recordShape },
+    { description: `Create a canonical memory record (a durable fact, decision, or preference). For notes that belong in the git vault, use put_page instead. A result carrying indexError was still stored (keyword-searchable, vector pending); do not retry it. Scope: ${SCOPES.add_memory}`, inputSchema: recordShape },
     async (args) => {
       require(SCOPES.add_memory);
       const rec = store.add(args as any);
-      await search.index(rec);
-      return json(rec);
+      return json({ ...rec, ...(await indexed(search, rec)) });
     });
 
   registerTool("get_record",
@@ -99,8 +149,7 @@ export function buildServer(
     async ({ id, patch }) => {
       require(SCOPES.update_memory);
       const rec = store.update(id, patch as any);
-      await search.index(rec);
-      return json(rec);
+      return json({ ...rec, ...(await indexed(search, rec)) });
     });
 
   registerTool("link_records",
@@ -111,8 +160,7 @@ export function buildServer(
       const head = store.currentOf(subject);
       if (!head) return json({ ok: false, error: "no such record" });
       const rec = store.update(head.id, { relationships: [...head.relationships, { predicate, object }] });
-      await search.index(rec);
-      return json({ ok: true, id: rec.id });
+      return json({ ok: true, id: rec.id, ...(await indexed(search, rec)) });
     });
 
   registerTool("list_recent",
@@ -139,7 +187,7 @@ export function buildServer(
 
   if (pages) {
     registerTool("search",
-      { description: `Primary recall tool. Unified hybrid search over vault pages and memory records, fusing keyword (FTS5) and semantic (vector) ranking with RRF, so it finds both exact terms and conceptual matches in one call. Start here; reach for get_page once you know the slug. Pass \`intent\` describing the SHAPE of your question — you know what you are asking and this server deliberately does not guess. Scope: ${SCOPES.search}`,
+      { description: `Primary recall tool. Unified hybrid search over vault pages and memory records, fusing keyword (FTS5) and semantic (vector) ranking with RRF, so it finds both exact terms and conceptual matches in one call. Start here; reach for get_page once you know the slug. Pass \`intent\` describing the SHAPE of your question — you know what you are asking and this server deliberately does not guess. 'confident' describes how well the QUERY matched (a top hit reached by both keyword and vector, close enough in meaning); it does not mean the answer is in that page. A confident hit can be the right page that never states the fact you need, so read the text before relying on it, and when 'confident' is false treat the result as nothing found. Each page hit's 'chunk' is the section the keyword ranking chose, and its 'section' (absent for text before the first heading) is that heading in the form get_page's 'section' accepts; 'vector_heading', when present, names a different section the semantic ranking chose, which get_page can fetch the same way. Fetch the section first and read the whole page only when it does not answer the question. Scope: ${SCOPES.search}`,
         inputSchema: {
           query: z.string(),
           limit: z.number().optional(),
@@ -149,17 +197,13 @@ export function buildServer(
           // send each value has to live here, phrased in the caller's terms rather
           // than as a bare enum of internal labels.
           intent: z.enum(SEARCH_INTENTS).optional().describe(
-            "The shape of the question. Send `entity` when the question is about one "
-            + "specific thing — a host, service, person, company, repo — and especially "
-            + "when its name means several different things (\"what runs on host X\", "
-            + "\"which box handles the mail\", \"what is mercury\"). That is the case "
-            + "where plain search measurably under-recalls, and this adds the pages "
-            + "closely linked to whatever it anchors on. "
-            + "The other values — `temporal`, `superseded`, `multihop`, `causal`, "
-            + "`factual` — are accepted so you can label a question honestly, but today "
-            + "they all retrieve exactly as omitting the field does; each was tested "
-            + "against the benchmark and made results worse, so none is wired up. "
-            + "Omitting the field is always safe and is never worse than a wrong label.",
+            "The shape of the question: `entity` (about one specific thing — a host, "
+            + "service, person, company, repo), `temporal`, `superseded`, `multihop`, "
+            + "`causal` or `factual`. Accepted so you can label a question honestly, but "
+            + "today every value retrieves exactly as omitting the field does: each "
+            + "special plan, including the linked-page expansion `entity` used to add, "
+            + "was tested against the benchmark and made results worse, so none is "
+            + "wired up. Omitting the field is always safe.",
           ),
         } },
       async ({ query, limit, intent }) => {
@@ -168,30 +212,93 @@ export function buildServer(
         return json({ hits, ...assessConfidence(hits) });
       });
 
+    // One get_page read, shared by get_page and get_pages. A miss on the exact
+    // slug falls through the alias/slugify tiers, so a title or alias typed
+    // where a slug was wanted still serves the page; `resolved_from` tells the
+    // caller the canonical slug for next time. `cap` applies to a whole page
+    // only; a section is returned whole.
+    const readPage = (slug: string, section: string | undefined, cap: number): Record<string, any> => {
+      const exact = pages.getPage(slug);
+      const resolved = exact && !exact.deleted_at ? null : pages.resolve(slug);
+      const p = exact && !exact.deleted_at ? exact : resolved ? pages.getPage(resolved) : undefined;
+      if (!p || p.deleted_at) return { error: "not_found", slug, suggestions: nearestSlugs(slug, pages.slugTitles()) };
+      const via = resolved && resolved !== slug ? { resolved_from: slug } : {};
+      const outline = () => splitSections(p.body).map((s) => ({ heading: s.heading, level: s.level, chars: s.text.length }));
+      if (section !== undefined) {
+        const want = section.trim().toLowerCase();
+        const hit = splitSections(p.body).find((s) => s.heading.toLowerCase() === want);
+        if (!hit) return { error: "not_found", slug: p.slug, section, sections: outline() };
+        return { slug: p.slug, title: p.title, section: hit.heading, body: hit.text, ...via };
+      }
+      if (p.body.length <= cap) return { ...p, ...via };
+      return { ...p, body: p.body.slice(0, cap), truncated: true, total_chars: p.body.length, sections: outline(), ...via };
+    };
+
     registerTool("get_page",
-      { description: `Fetch one page by slug. Cheap. A title or alias also works: a miss on the exact slug falls through the alias and slugify tiers and the page comes back with 'resolved_from' set. A true miss returns {error: not_found, suggestions: [nearest live slugs]} rather than null. A body over ${PAGE_MAX_CHARS} chars comes back cut at that point with 'truncated: true', 'total_chars' and a 'sections' outline (heading, level, chars); pass 'section' (a heading's text, case-insensitive) to fetch just that section, or 'max_chars' to change the cap. Scope: ${SCOPES.get_page}`,
+      { description: `Fetch one page by slug. When a search hit carries 'section', pass it here to get only that section; many pages are 30-50 KB. A title or alias also works: a miss on the exact slug falls through the alias and slugify tiers and the page comes back with 'resolved_from' set. A true miss returns {error: not_found, suggestions: [nearest live slugs]} rather than null. A body over ${PAGE_MAX_CHARS} chars comes back cut at that point with 'truncated: true', 'total_chars' and a 'sections' outline (heading, level, chars); pass 'section' (a heading's text, case-insensitive) to fetch just that section, or 'max_chars' to change the cap. Scope: ${SCOPES.get_page}`,
         inputSchema: { slug: z.string(), section: z.string().optional(), max_chars: z.number().optional() } },
       async ({ slug, section, max_chars }) => {
         require(SCOPES.get_page);
-        // A miss on the exact slug falls through the alias/slugify tiers, so a
-        // title or alias typed where a slug was wanted still serves the page.
-        // `resolved_from` tells the caller the canonical slug for next time.
-        const exact = pages.getPage(slug);
-        const resolved = exact && !exact.deleted_at ? null : pages.resolve(slug);
-        const p = exact && !exact.deleted_at ? exact : resolved ? pages.getPage(resolved) : undefined;
-        if (!p || p.deleted_at) return json({ error: "not_found", slug, suggestions: nearestSlugs(slug, pages.slugTitles()) });
-        const via = resolved && resolved !== slug ? { resolved_from: slug } : {};
-        const outline = () => splitSections(p.body).map((s) => ({ heading: s.heading, level: s.level, chars: s.text.length }));
-        if (section !== undefined) {
-          const want = section.trim().toLowerCase();
-          const hit = splitSections(p.body).find((s) => s.heading.toLowerCase() === want);
-          if (!hit) return json({ error: "not_found", slug: p.slug, section, sections: outline() });
-          return json({ slug: p.slug, title: p.title, section: hit.heading, body: hit.text, ...via });
-        }
-        const cap = max_chars ?? PAGE_MAX_CHARS;
-        if (p.body.length <= cap) return json({ ...p, ...via });
-        return json({ ...p, body: p.body.slice(0, cap), truncated: true, total_chars: p.body.length, sections: outline(), ...via });
+        return json(readPage(slug, section, max_chars ?? PAGE_MAX_CHARS));
       });
+
+    // Several get_page reads in one call (claude-mem's get_observations(ids)
+    // shape). One body budget covers the whole batch, spent in request order,
+    // so ten large pages cannot overflow a client's tool-output cap.
+    registerTool("get_pages",
+      { description: `Fetch up to ${GET_PAGES_MAX} pages or sections in one call: 'pages' is a list of {slug, section?}, and each result has exactly get_page's shape, in request order (a miss is that item's {error: not_found, ...}, not a failed call). Use it when a search returned several hits worth reading, passing each hit's 'section'. The bodies share one ${PAGE_MAX_CHARS}-char budget, spent in order; an item past it comes back cut with 'truncated: true' and 'total_chars' (and the 'sections' outline for a whole page), so list the most important first. Scope: ${SCOPES.get_pages}`,
+        inputSchema: { pages: z.array(z.object({ slug: z.string(), section: z.string().optional() })).min(1).max(GET_PAGES_MAX) } },
+      async ({ pages: wanted }) => {
+        require(SCOPES.get_pages);
+        let left = PAGE_MAX_CHARS;
+        const out = wanted.map(({ slug, section }) => {
+          const r = readPage(slug, section, left);
+          if (typeof r.body === "string" && r.body.length > left) {
+            // Only a section can overrun: a whole page was already cut to `left`.
+            Object.assign(r, { body: r.body.slice(0, left), truncated: true, total_chars: r.body.length });
+          }
+          if (typeof r.body === "string") left -= r.body.length;
+          return r;
+        });
+        return json({ pages: out });
+      });
+
+    // Reads the vault's git log, so it needs the vault root. Commit subjects are
+    // free text the deny-list never sees; the activity-digest filter withholds
+    // the sensitive ones and the count says so.
+    if (vaultConfig) {
+      registerTool("page_history",
+        { description: `When a page was first added, when it last changed, and every commit that changed it, newest first (ISO time + commit subject), from the vault's git history. Use it for questions only the history answers: when something was written down, how often a page was revised, what changed in a given week. search finds pages by their text and cannot see this. A pure rename is not a change, and commits made under a page's old path count toward it. A title or alias works as with get_page. 'limit' (default 50) caps the list; 'total' is always the full count. Commits whose subjects match the sensitive-subject filter are left out and counted in 'withheld'. Generated pages have no source file and so no history. Scope: ${SCOPES.page_history}`,
+          inputSchema: { slug: z.string(), limit: z.number().optional() } },
+        async ({ slug, limit }) => {
+          require(SCOPES.page_history);
+          const exact = pages.getPage(slug);
+          const resolved = exact && !exact.deleted_at ? null : pages.resolve(slug);
+          const p = exact && !exact.deleted_at ? exact : resolved ? pages.getPage(resolved) : undefined;
+          if (!p || p.deleted_at) return json({ error: "not_found", slug, suggestions: nearestSlugs(slug, pages.slugTitles()) });
+          const via = resolved && resolved !== slug ? { resolved_from: slug } : {};
+          if (!p.source_path) return json({ error: "no_source_file", slug: p.slug, ...via });
+          const all = pageHistoryOf(vaultConfig.root, p.source_path);
+          const shown = all.filter((c) => !SENSITIVE.test(c.subject));
+          const n = limit !== undefined && limit > 0 ? Math.floor(limit) : 50;
+          // git's %cI keeps each committer's own offset, so a vault written from
+          // a laptop and a UTC server mixes -04:00 and Z. Report UTC so the dates compare
+          // as strings; one git cannot parse is passed through as-is.
+          const utc = (iso: string) => {
+            const t = new Date(iso);
+            return isNaN(t.getTime()) ? iso : t.toISOString().replace(/\.000Z$/, "Z");
+          };
+          const first = all.at(-1);
+          return json({
+            slug: p.slug, title: p.title, source_path: p.source_path, total: all.length,
+            first_added: first ? utc(first.iso) : null, last_changed: all[0] ? utc(all[0].iso) : null,
+            commits: shown.slice(0, n).map((c) => ({ date: utc(c.iso), subject: c.subject })),
+            ...(all.length > shown.length ? { withheld: all.length - shown.length } : {}),
+            ...(shown.length > n ? { truncated: true } : {}),
+            ...via,
+          });
+        });
+    }
 
     registerTool("list_pages",
       { description: `List pages (slug/title/source_path). An inventory, not a search: it does not rank or filter by relevance. Use 'search' to find something. Scope: ${SCOPES.list_pages}`, inputSchema: { limit: z.number().optional() } },
@@ -227,11 +334,11 @@ export function buildServer(
       async ({ text }) => { require(SCOPES.resolve_slug); return json({ slug: pages.resolve(text) }); });
 
     registerTool("doctor",
-      { description: `Pages index health: page count, unresolved links, orphans, chunk provenance, and last vault sync. Operational telemetry, not knowledge; use 'search' to answer questions. Scope: ${SCOPES.doctor}`, inputSchema: {} },
+      { description: `Pages index health: page count, unresolved links, orphans, chunk provenance, and last vault sync. Operational telemetry, not knowledge; use 'search' to answer questions. The orphan count uses the 'orphans' tool's definition, which includes raw/ and daily/ pages; the finding ledger's orphan items skip those prefixes, so its count is lower by design. Scope: ${SCOPES.doctor}`, inputSchema: {} },
       async () => { require(SCOPES.doctor); return json(pages.pageHealth()); });
 
     registerTool("orphans",
-      { description: `Live authored pages with no inbound links, i.e. unreachable from the rest of the graph. Excludes generated pages. Scope: ${SCOPES.orphans}`, inputSchema: {} },
+      { description: `Live authored pages with no inbound links, i.e. unreachable from the rest of the graph. Excludes generated pages. Includes raw/ and daily/ pages (session notes and dailies), which the finding ledger's orphan detector skips because they are not meant to be linked to, so this list is longer than the ledger's orphan items. Neither count is wrong. Scope: ${SCOPES.orphans}`, inputSchema: {} },
       async () => { require(SCOPES.orphans); return json({ orphans: pages.orphans() }); });
 
     registerTool("recent_pages",
@@ -304,7 +411,7 @@ export function buildServer(
       });
 
     registerTool("add_finding",
-      { description: `File ONE item that needs a human. Appends only: unlike report_findings, this never resolves anything, so a caller may file the single item it just found without knowing what else is outstanding. Re-filing the same subject refreshes detail/due/doc and counts the repeat; it reopens a resolved item but leaves a wont_fix one declined. 'subject' is the identity — reuse the existing one to update an item, and call 'findings' first to see what is already open. The result says whether the row was 'created' or re-filed ('times_reported'), and 'similar' lists open same-kind keys whose subject shares a word with this one — a near-duplicate to fold into, or to ignore if it is genuinely distinct. 'due' takes a bare YYYY-MM-DD (stored as end of that day, UTC) or a full ISO-8601 instant; an item with no due date is never nagged about, only counted. 'doc' is the SLUG of a page that holds the assignment — pass it when the work is a plan, a migration, or anything that will change as it is worked, because 'detail' is a snapshot while a page can be edited and linked; still put enough in 'detail' to act without opening it, and write the FIRST LINE of 'detail' as the whole summary, since that is all the session-start hook shows. A 'doc' naming a page that does not exist yet is accepted on purpose — filing the ask before writing the page is the normal order — and the readers report the miss rather than refusing the write. Kind 'todo' is a dated item for the owner; close one with \`enscribe findings resolve todo:<subject> "<reason>"\`. Appendable kinds: ${APPENDABLE_KINDS.join(", ")}. Scope: ${SCOPES.add_finding}`,
+      { description: `File ONE item that needs a human. Appends only: unlike report_findings, this never resolves anything, so a caller may file the single item it just found without knowing what else is outstanding. Re-filing the same subject refreshes detail/due/doc and counts the repeat; it reopens a resolved item but leaves a wont_fix one declined. 'subject' is the identity — reuse the existing one to update an item, and call 'findings' first to see what is already open. The result says whether the row was 'created' or re-filed ('times_reported'), and 'similar' lists open same-kind keys whose subject shares a word with this one — a near-duplicate to fold into, or to ignore if it is genuinely distinct. 'due' takes a bare YYYY-MM-DD (stored as end of that day, UTC) or a full ISO-8601 instant; an item with no due date is never nagged about, only counted. 'doc' is the SLUG of a page that holds the assignment — pass it when the work is a plan, a migration, or anything that will change as it is worked, because 'detail' is a snapshot while a page can be edited and linked; still put enough in 'detail' to act without opening it, and write the FIRST LINE of 'detail' as the whole summary, since that is all the session-start hook shows. A 'doc' naming a page that does not exist yet is accepted on purpose — filing the ask before writing the page is the normal order — and the readers report the miss rather than refusing the write. Kind 'todo' is a dated item for the owner; close one with \`enscribe findings resolve todo:<subject> "<reason>"\`. Kind 'alert' is something happening now that the owner should see soon (a service down, an account overdrawn, a deadline today); the desk panel shows open alerts as a red banner, so resolve one with \`enscribe findings resolve alert:<subject> "<reason>"\` as soon as the condition clears. Scripts file the same rows with \`enscribe findings add\`. Appendable kinds: ${APPENDABLE_KINDS.join(", ")}. Scope: ${SCOPES.add_finding}`,
         inputSchema: {
           kind: z.string(),
           subject: z.string(),
@@ -314,40 +421,17 @@ export function buildServer(
         } },
       async ({ kind, subject, detail, due, doc }) => {
         require(SCOPES.add_finding);
-        // Appending a kind the nightly reconcile owns would create a row that
-        // the very next detection run resolves, having never detected it, and
-        // the pair would flap open/resolved forever.
-        if (!APPENDABLE_KINDS.includes(kind)) {
-          throw new Error(`add_finding: kind '${kind}' is not appendable (appendable: ${APPENDABLE_KINDS.join(", ")}); nothing was written`);
-        }
-        // Normalized (and validated) at the one write path rather than at
-        // each reader: `due` is compared as text, so a bare YYYY-MM-DD would
-        // read overdue on its own due day, and `subject` is the row's
-        // identity that the bash reader splits on `|`. Both normalizers
-        // throw on a shape they can't make safe, and both are evaluated
-        // before findings.add runs, so a rejection writes nothing.
-        const normalizedSubject = normalizeSubject(subject);
-        // Same kind, not resolved, not this subject, sharing a word of three
-        // or more characters. Computed BEFORE the write so the new row never
-        // matches itself; a hint list for the caller, never a refusal.
-        const words = (s: string) => new Set(s.toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length >= 3));
-        const mine = words(normalizedSubject);
-        const similar = findings.list({ kind })
-          .filter((f) => f.state !== "resolved" && f.subject !== normalizedSubject)
-          .filter((f) => [...words(f.subject)].some((w) => mine.has(w)))
-          .map((f) => f.key)
-          .slice(0, 10);
-        const wrote = findings.add(
-          { kind, subject: normalizedSubject, detail, due: normalizeDue(due), doc: doc ?? null },
-          "add_finding", new Date().toISOString(),
-        );
+        // Kind whitelist, subject/due normalizers and the `similar` hint all
+        // live in appendFinding, which the `findings add` CLI shares, so the
+        // two write paths cannot drift apart. It throws before writing.
+        const wrote = appendFinding(findings, { kind, subject, detail, due, doc }, "add_finding", new Date().toISOString());
         // Report whether the named page actually resolves, but never refuse on
         // it: filing the ask before writing the page is the normal order, so a
         // miss is information for the caller, not an error. `doc_resolved` is
         // absent entirely when no doc was given.
         const docResolved = doc && deps.pages ? deps.pages.resolve(doc) !== null : undefined;
         return json({
-          ok: true, key: findingKey(kind, normalizedSubject), ...wrote, similar,
+          ok: true, ...wrote,
           ...(doc ? { doc, doc_resolved: docResolved } : {}),
         });
       });

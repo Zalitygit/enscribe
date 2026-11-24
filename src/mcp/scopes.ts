@@ -9,6 +9,8 @@ export const SCOPES = {
   summarize_context: "memory.read",
   search: "pages.read",
   get_page: "pages.read",
+  get_pages: "pages.read",
+  page_history: "pages.read",
   list_pages: "pages.read",
   get_links: "pages.read",
   get_backlinks: "pages.read",

@@ -113,6 +113,24 @@ test("indexing a superseding version prunes the prior version from the search in
   expect(vecCount(v2.id)).toBe(1);
 });
 
+// The new version is committed before its vector is embedded, so v1 is no
+// longer current whether or not the embed succeeds. A failed embed must not
+// leave v1 in the indexes while v2 has no vector.
+test("a superseding version prunes the prior version even when its embed fails", async () => {
+  const embedder = new FakeEmbedder();
+  search = new SearchService(db, store, embedder);
+  const v1 = await add("Ports", "eero forwards port 3133");
+  embedder.embed = async () => { throw new Error("embedding unavailable"); };
+
+  const v2 = store.update(v1.id, { content: "eero forwards port 3134 now" });
+  await expect(search.index(v2)).rejects.toThrow("embedding unavailable");
+
+  expect(ftsCount(v1.id)).toBe(0);
+  expect(vecCount(v1.id)).toBe(0);
+  expect(relCount(v1.id)).toBe(0);
+  expect(ftsCount(v2.id)).toBe(1);
+});
+
 test("indexing a superseding version prunes the prior version's relationship rows", async () => {
   const v1 = store.add({
     type: "note", subject: "Linked", content: "edge holder",

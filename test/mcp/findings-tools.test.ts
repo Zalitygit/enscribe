@@ -185,6 +185,18 @@ test("add_finding files a todo and normalizes its bare due date", async () => {
   });
 });
 
+// An alert is the third appendable kind (2026-11-04): a condition happening
+// now, filed by a session or a script, that the P4 desk panel shows.
+test("add_finding files an alert", async () => {
+  const { client, findings } = await findingsClient();
+  const r = textOf(await client.callTool({
+    name: "add_finding",
+    arguments: { kind: "alert", subject: "mail-down", detail: "mail server refusing connections" },
+  }));
+  expect(r).toMatchObject({ ok: true, key: "alert:mail-down", created: true, times_reported: 1 });
+  expect(findings.get("alert:mail-down")).toMatchObject({ kind: "alert", state: "open", source: "add_finding" });
+});
+
 // The point of normalizing at the write path: the hook's overdue test is a
 // string compare, and a bare date loses it on the item's own due day.
 test("a todo due today is not yet overdue by the hook's comparison", async () => {
